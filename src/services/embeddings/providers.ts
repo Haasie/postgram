@@ -39,7 +39,7 @@ const OPENAI_DEFAULT_DIMENSIONS = 1536;
 const OLLAMA_DEFAULT_MODEL = 'bge-m3';
 const OLLAMA_DEFAULT_DIMENSIONS = 1024;
 // Mistral Embed uses the same 1024-dimensional space as bge-m3.
-const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed-2312';
+const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed';
 const OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS = 1024;
 
 export function resolveEmbeddingDefaults(
@@ -260,6 +260,12 @@ async function safeReadSnippet(response: Response): Promise<string> {
   }
 }
 
+// Mistral (and many other openai-compatible providers) cap the number of
+// inputs per embeddings request. 512 is Mistral's documented limit; using it
+// as a safe default avoids 400 errors on large documents that produce
+// hundreds of chunks.
+const OPENAI_COMPATIBLE_MAX_BATCH_SIZE = 512;
+
 export function createOpenAICompatibleEmbeddingProvider(
   config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>
 ): EmbeddingProvider {
@@ -269,10 +275,7 @@ export function createOpenAICompatibleEmbeddingProvider(
     baseURL: config.baseUrl.replace(/\/+$/, '')
   }) as OpenAIEmbeddingClient;
 
-  async function embedBatch(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) {
-      return [];
-    }
+  async function embedBatchPage(texts: string[]): Promise<number[][]> {
     try {
       const response = await client.embeddings.create({
         model: config.model,
@@ -306,6 +309,20 @@ export function createOpenAICompatibleEmbeddingProvider(
         baseUrl: config.baseUrl
       });
     }
+  }
+
+  async function embedBatch(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) {
+      return [];
+    }
+    // Split into pages to respect per-request input limits.
+    const results: number[][] = [];
+    for (let i = 0; i < texts.length; i += OPENAI_COMPATIBLE_MAX_BATCH_SIZE) {
+      const page = texts.slice(i, i + OPENAI_COMPATIBLE_MAX_BATCH_SIZE);
+      const pageVectors = await embedBatchPage(page);
+      results.push(...pageVectors);
+    }
+    return results;
   }
 
   async function embed(text: string): Promise<number[]> {

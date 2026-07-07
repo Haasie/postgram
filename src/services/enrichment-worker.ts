@@ -38,7 +38,15 @@ function isRateLimitError(error: unknown): boolean {
     return (
       error.message.includes('429') ||
       error.message.toLowerCase().includes('rate limit') ||
-      error.message.toLowerCase().includes('rate_limited')
+      error.message.toLowerCase().includes('rate_limited') ||
+      // Mistral's openai-compatible endpoint sometimes returns "400 status code
+      // (no body)" when rate-limited instead of the standard 429. Treat it as
+      // transient so the worker backs off and retries rather than permanently
+      // failing the entity.
+      error.message === '400 status code (no body)' ||
+      // Network-level connection drops ("Connection error.") can also occur
+      // under heavy embedding load. Treat as transient.
+      error.message === 'Connection error.'
     );
   }
   return false;
@@ -328,12 +336,24 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
       }
 
       if (isRateLimitError(error)) {
-        // 429 from the embedding API is transient — re-throw so the worker
-        // loop applies back-off. The entity stays 'pending' (the transaction
-        // was rolled back) and will be retried after the pause.
+        // Transient error (429, connection drop, etc.) — mark the entity
+        // 'failed' with attempts=0 so the 5-minute cooldown in the SELECT
+        // query prevents it from being immediately re-queued on the next poll.
+        // This avoids an infinite retry loop when the rate limit window is
+        // longer than the worker's backoff pause.
         logger.warn(
           { entityId: entity.id },
           'enrichment deferred — embedding rate limit (429), will back off and retry'
+        );
+        await options.pool.query(
+          `
+            UPDATE entities
+            SET enrichment_status = 'failed',
+                enrichment_attempts = 0,
+                enrichment_error = 'rate-limited (transient)'
+            WHERE id = $1
+          `,
+          [entity.id]
         );
         throw error;
       }
