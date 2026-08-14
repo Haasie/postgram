@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import type { Pool } from 'pg';
+import type { Logger } from 'pino';
 
 import {
   checkTypeAccess,
@@ -293,6 +294,7 @@ function createSessionServer(
   auth: AuthContext,
   options: {
     embeddingService?: EmbeddingService | undefined;
+    logger?: Pick<Logger, 'debug' | 'warn'> | undefined;
     extractionEnabled?: boolean | undefined;
   } = {}
 ) {
@@ -519,7 +521,7 @@ function createSessionServer(
     'search',
     {
       description:
-        'Search stored knowledge using hybrid BM25 + vector similarity with recency weighting. Set expand_graph=true to also return graph-connected entities (requires extraction to have run on the matching documents — use the queue tool to check status). Use expand_graph when exploring relationships, tracing decisions, or understanding what else is connected to a topic.',
+        'Search stored knowledge using hybrid BM25 + vector similarity with recency weighting. Compact results may include edges.count and edges.relations so agents can see traversable graph context without neighbor content. Set expand_graph=true to also return graph-connected entities (requires extraction to have run on the matching documents — use the queue tool to check status). Use expand_graph when exploring relationships, tracing decisions, or understanding what else is connected to a topic; avoid it for direct facts already present in compact results.',
       inputSchema: {
         query: z.string().min(1),
         type: entityTypeSchema.optional(),
@@ -555,7 +557,8 @@ function createSessionServer(
             memoryRole: args.memory_role,
           },
           {
-            embeddingService: options.embeddingService
+            embeddingService: options.embeddingService,
+            logger: options.logger
           }
         ),
         (value) => ({
@@ -564,6 +567,7 @@ function createSessionServer(
             chunk_content: entry.chunkContent,
             similarity: entry.similarity,
             score: entry.score,
+            ...(entry.edges ? { edges: entry.edges } : {}),
             ...(entry.related ? { related: entry.related } : {})
           }))
         }),
@@ -958,6 +962,7 @@ export function registerMcpRoutes(
   pool: Pool,
   options: {
     embeddingService?: EmbeddingService | undefined;
+    logger?: Pick<Logger, 'debug' | 'warn'> | undefined;
     extractionEnabled?: boolean | undefined;
     resourceMetadataUrl?: string | undefined;
   } = {}

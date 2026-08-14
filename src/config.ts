@@ -5,12 +5,17 @@ import { z } from 'zod';
 // silently break `a ?? b` fallback chains that depend on blank == unset.
 const emptyToUndefined = (value: unknown): unknown =>
   typeof value === 'string' && value.trim() === '' ? undefined : value;
-const optionalString = z.preprocess(emptyToUndefined, z.string().min(1).optional());
+const optionalString = z.preprocess(
+  emptyToUndefined,
+  z.string().min(1).optional()
+);
 
 const configSchema = z
   .object({
     DATABASE_URL: z.string().min(1),
+    ADMIN_MFA_SECRET_KEY: optionalString,
     OPENAI_API_KEY: optionalString,
+    ADMIN_SETTINGS_ENCRYPTION_KEY: optionalString,
     PORT: z.coerce.number().int().positive().default(3100),
     OAUTH_ENABLED: z
       .enum(['true', 'false'])
@@ -20,7 +25,24 @@ const configSchema = z
     LOG_LEVEL: z
       .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal'])
       .default('info'),
-    ENRICHMENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
+    ENRICHMENT_POLL_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(1000),
+    EMBEDDING_TIMEOUT_MS: z.preprocess(
+      emptyToUndefined,
+      z.coerce.number().int().positive().default(15000)
+    ),
+    QUERY_EMBEDDING_CACHE_SECRET: optionalString,
+    QUERY_EMBEDDING_CACHE_SIZE: z.preprocess(
+      emptyToUndefined,
+      z.coerce.number().int().positive().default(512)
+    ),
+    QUERY_EMBEDDING_CACHE_RETENTION_DAYS: z.preprocess(
+      emptyToUndefined,
+      z.coerce.number().int().positive().default(30)
+    ),
     EXTRACTION_ENABLED: z
       .enum(['true', 'false'])
       .default('false')
@@ -38,11 +60,10 @@ const configSchema = z
       .enum(['true', 'false'])
       .default('true')
       .transform((v) => v === 'true'),
-    EXTRACTION_REASONING_EFFORT: z
-      .preprocess(
-        emptyToUndefined,
-        z.enum(['minimal', 'low', 'medium', 'high']).optional()
-      ),
+    EXTRACTION_REASONING_EFFORT: z.preprocess(
+      emptyToUndefined,
+      z.enum(['minimal', 'low', 'medium', 'high']).optional()
+    ),
     EXTRACTION_AUTO_CREATE_ENTITIES: z
       .enum(['true', 'false'])
       .default('false')
@@ -60,7 +81,14 @@ const configSchema = z
       )
       .pipe(
         z.array(
-          z.enum(['memory', 'person', 'project', 'task', 'interaction', 'document'])
+          z.enum([
+            'memory',
+            'person',
+            'project',
+            'task',
+            'interaction',
+            'document'
+          ])
         )
       ),
     EXTRACTION_AUTO_CREATE_MIN_CONFIDENCE: z.preprocess(
@@ -93,8 +121,14 @@ const configSchema = z
             return z.NEVER;
           }
           if (
-            !['memory', 'person', 'project', 'task', 'interaction', 'document']
-              .includes(rawType)
+            ![
+              'memory',
+              'person',
+              'project',
+              'task',
+              'interaction',
+              'document'
+            ].includes(rawType)
           ) {
             ctx.addIssue({
               code: z.ZodIssueCode.custom,
@@ -212,7 +246,6 @@ const configSchema = z
         message: 'EMBEDDING_BASE_URL is required for EMBEDDING_PROVIDER=openai-compatible'
       });
     }
-
     if (cfg.OAUTH_ENABLED && !cfg.PUBLIC_BASE_URL) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

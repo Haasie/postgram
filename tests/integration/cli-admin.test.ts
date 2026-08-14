@@ -13,6 +13,7 @@ import {
   vectorToSql,
   type EmbeddingService
 } from '../../src/services/embedding-service.js';
+import { saveProviderConfiguration } from '../../src/services/admin-provider-config-service.js';
 import { storeEntity } from '../../src/services/entity-service.js';
 import type { Entity } from '../../src/types/entities.js';
 import {
@@ -218,6 +219,75 @@ describe('pgm-admin CLI', () => {
     if (database) {
       await database.close();
     }
+  });
+
+  it('uses the last applied admin embedding settings as the migration target', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const saved = await saveProviderConfiguration(database.pool, {
+      settings: {
+        EMBEDDING_PROVIDER: 'openai',
+        EMBEDDING_MODEL: 'text-embedding-3-small',
+        EMBEDDING_DIMENSIONS: 1536
+      }
+    });
+    expect(saved.isOk()).toBe(true);
+
+    await database.pool.query(
+      `
+        UPDATE admin_runtime_settings
+        SET state = 'applied',
+            applied_value = value,
+            applied_version = applied_version + 1,
+            applied_at = now()
+        WHERE key = ANY($1::text[])
+      `,
+      [
+        [
+          'EMBEDDING_PROVIDER',
+          'EMBEDDING_MODEL',
+          'EMBEDDING_DIMENSIONS'
+        ]
+      ]
+    );
+
+    const pendingEdit = await saveProviderConfiguration(database.pool, {
+      settings: {
+        EMBEDDING_PROVIDER: 'ollama',
+        EMBEDDING_MODEL: 'bge-m3',
+        EMBEDDING_DIMENSIONS: 1024
+      }
+    });
+    expect(pendingEdit.isOk()).toBe(true);
+
+    const result = await runAdmin(
+      [
+        '--json',
+        'embeddings',
+        'migrate',
+        '--target-dimensions',
+        '1536',
+        '--dry-run'
+      ],
+      {
+        DATABASE_URL: getDatabaseUrl(database),
+        OPENAI_API_KEY: 'sk-admin-migration-target-test',
+        EMBEDDING_PROVIDER: 'ollama',
+        EMBEDDING_MODEL: 'bge-m3',
+        EMBEDDING_DIMENSIONS: '1024'
+      }
+    );
+
+    expect(parseJson(result.stdout)).toMatchObject({
+      dryRun: true,
+      target: {
+        provider: 'openai',
+        name: 'text-embedding-3-small',
+        dimensions: 1536
+      }
+    });
   });
 
   it('creates, lists, revokes keys, and emits audit rows for admin actions', async () => {
@@ -787,6 +857,10 @@ describe('pgm-admin CLI', () => {
       type: 'memory',
       content: 'entity that succeeded extraction'
     }))._unsafeUnwrap();
+    const failedTask = (await storeEntity(database.pool, makeAuthContext(seededKey.record.id), {
+      type: 'task',
+      content: 'task that failed extraction'
+    }))._unsafeUnwrap();
 
     await database.pool.query(
       `UPDATE entities
@@ -799,9 +873,13 @@ describe('pgm-admin CLI', () => {
       "UPDATE entities SET extraction_status = 'completed' WHERE id = $1",
       [completed.id]
     );
+    await database.pool.query(
+      "UPDATE entities SET extraction_status = 'failed' WHERE id = $1",
+      [failedTask.id]
+    );
 
     const result = await runAdmin(
-      ['reextract', '--only-failed', '--json'],
+      ['reextract', '--type', 'memory', '--only-failed', '--json'],
       { DATABASE_URL: databaseUrl }
     );
     const body = parseJson(result.stdout) as { markedCount: number };
@@ -813,17 +891,21 @@ describe('pgm-admin CLI', () => {
       extraction_error: string | null;
     }>(
       'SELECT id, extraction_status, extraction_error FROM entities WHERE id = ANY($1)',
-      [[failed.id, completed.id]]
+      [[failed.id, completed.id, failedTask.id]]
     );
     const byId = Object.fromEntries(rows.rows.map((r) => [r.id, r]));
     expect(byId[failed.id]?.extraction_status).toBe('pending');
     expect(byId[failed.id]?.extraction_error).toBeNull();
     expect(byId[completed.id]?.extraction_status).toBe('completed');
+    expect(byId[failedTask.id]?.extraction_status).toBe('failed');
 
-    const auditRows = await database.pool.query<{ details: { onlyFailed: boolean } }>(
+    const auditRows = await database.pool.query<{
+      details: { onlyFailed: boolean; type: string };
+    }>(
       "SELECT details FROM audit_log WHERE operation = 'reextract.start' ORDER BY timestamp DESC LIMIT 1"
     );
     expect(auditRows.rows[0]?.details.onlyFailed).toBe(true);
+    expect(auditRows.rows[0]?.details.type).toBe('memory');
   }, 120_000);
 
   it('reextract --id re-queues a single entity', async () => {
@@ -1231,6 +1313,10 @@ describe('pgm-admin CLI', () => {
       type: 'memory',
       content: 'entity that succeeded enrichment'
     }))._unsafeUnwrap();
+    const failedTask = (await storeEntity(database.pool, makeAuthContext(seededKey.record.id), {
+      type: 'task',
+      content: 'task that failed enrichment'
+    }))._unsafeUnwrap();
 
     await database.pool.query(
       `UPDATE entities
@@ -1246,9 +1332,16 @@ describe('pgm-admin CLI', () => {
        WHERE id = $1`,
       [completed.id]
     );
+    await database.pool.query(
+      `UPDATE entities
+       SET enrichment_status = 'failed',
+           enrichment_attempts = 3
+       WHERE id = $1`,
+      [failedTask.id]
+    );
 
     const result = await runAdmin(
-      ['reembed', '--only-failed', '--json'],
+      ['reembed', '--type', 'memory', '--only-failed', '--json'],
       { DATABASE_URL: databaseUrl }
     );
     const body = parseJson(result.stdout) as { markedCount: number };
@@ -1260,18 +1353,23 @@ describe('pgm-admin CLI', () => {
       enrichment_attempts: number;
     }>(
       'SELECT id, enrichment_status, enrichment_attempts FROM entities WHERE id = ANY($1)',
-      [[failed.id, completed.id]]
+      [[failed.id, completed.id, failedTask.id]]
     );
     const byId = Object.fromEntries(rows.rows.map((r) => [r.id, r]));
     expect(byId[failed.id]?.enrichment_status).toBe('pending');
     expect(byId[failed.id]?.enrichment_attempts).toBe(0);
     expect(byId[completed.id]?.enrichment_status).toBe('completed');
     expect(byId[completed.id]?.enrichment_attempts).toBe(1);
+    expect(byId[failedTask.id]?.enrichment_status).toBe('failed');
+    expect(byId[failedTask.id]?.enrichment_attempts).toBe(3);
 
-    const auditRows = await database.pool.query<{ details: { onlyFailed: boolean } }>(
+    const auditRows = await database.pool.query<{
+      details: { onlyFailed: boolean; type: string };
+    }>(
       "SELECT details FROM audit_log WHERE operation = 'reembed.start' ORDER BY timestamp DESC LIMIT 1"
     );
     expect(auditRows.rows[0]?.details.onlyFailed).toBe(true);
+    expect(auditRows.rows[0]?.details.type).toBe('memory');
   }, 120_000);
 
   it('memory groom archives eligible session context for one client', async () => {
