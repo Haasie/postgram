@@ -32,7 +32,7 @@ export class RateLimitError extends Error {
  * Matches the error message format produced by createOpenAiProvider and
  * other providers in llm-provider.ts.
  */
-function isRateLimitError(error: unknown): boolean {
+export function isRateLimitError(error: unknown): boolean {
   if (error instanceof RateLimitError) return true;
   if (error instanceof Error) {
     return (
@@ -157,6 +157,16 @@ function shouldQueueExtractionForEntity(input: {
   extractionMemoryMode?: ExtractionMemoryMode | undefined;
 }): boolean {
   if (!input.extractionEnabled) {
+    return false;
+  }
+
+  const path = typeof input.metadata?.path === 'string' ? input.metadata.path : '';
+  if (
+    path.startsWith('90 Archive/') ||
+    path.startsWith('99 Systeem/') ||
+    path.endsWith('.excalidraw.md') ||
+    path.endsWith('.excalidraw')
+  ) {
     return false;
   }
 

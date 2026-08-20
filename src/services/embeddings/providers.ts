@@ -373,10 +373,9 @@ async function safeReadSnippet(response: Response): Promise<string> {
 }
 
 // Mistral (and many other openai-compatible providers) cap the number of
-// inputs per embeddings request. 512 is Mistral's documented limit; using it
-// as a safe default avoids 400 errors on large documents that produce
-// hundreds of chunks.
-const OPENAI_COMPATIBLE_MAX_BATCH_SIZE = 512;
+// inputs and total tokens per embeddings request. Using 64 as a safe default
+// avoids 400 errors on large documents that produce hundreds of chunks.
+const OPENAI_COMPATIBLE_MAX_BATCH_SIZE = 64;
 
 export function createOpenAICompatibleEmbeddingProvider(
   config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>
@@ -391,7 +390,7 @@ export function createOpenAICompatibleEmbeddingProvider(
     try {
       const response = await client.embeddings.create({
         model: config.model,
-        input: texts,
+        input: texts.map((t) => t.toWellFormed()),
         encoding_format: 'float'
       });
       const ordered = response.data
