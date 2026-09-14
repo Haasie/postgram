@@ -1,3 +1,21 @@
+## [1.37.1](https://github.com/ivo-toby/postgram/compare/cli-v1.37.0...cli-v1.37.1) (2026-09-03)
+
+### Bug Fixes
+
+* **skill:** remove personal identifiers ([7924b77](https://github.com/ivo-toby/postgram/commit/7924b77e992c3f444cc40c784250a4ba3cb3f6c4))
+
+## [1.37.0](https://github.com/ivo-toby/postgram/compare/cli-v1.36.1...cli-v1.37.0) (2026-09-02)
+
+### Features
+
+* make search retrieval chunk-first [] ([#106](https://github.com/ivo-toby/postgram/issues/106)) ([8f0a2d1](https://github.com/ivo-toby/postgram/commit/8f0a2d16a8d1dca9384a6ac7342e84a0cd1517ef))
+
+## [1.36.1](https://github.com/ivo-toby/postgram/compare/cli-v1.36.0...cli-v1.36.1) (2026-09-02)
+
+### Performance Improvements
+
+* reduce search latency [] ([#105](https://github.com/ivo-toby/postgram/issues/105)) ([813826d](https://github.com/ivo-toby/postgram/commit/813826d0d2e4d301b36cb7293a77c669a8d1aed4))
+
 ## [1.36.0](https://github.com/ivo-toby/postgram/compare/cli-v1.35.1...cli-v1.36.0) (2026-07-26)
 
 ### Features
