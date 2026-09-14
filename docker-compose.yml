@@ -99,7 +99,7 @@ services:
   postgram-ui:
     image: postgram-postgram-ui:latest
     ports:
-      - '${UI_BIND_HOST:-0.0.0.0}:${UI_PORT:-3102}:3000'
+      - '${UI_BIND_HOST:-0.0.0.0}:${UI_PORT:-3102}:80'
     depends_on:
       mcp-server:
         condition: service_healthy
