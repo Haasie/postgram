@@ -1,11 +1,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { createEmbeddingService } from '../../src/services/embedding-service.js';
+import {
+  createEmbeddingService,
+  pruneQueryEmbeddingCache
+} from '../../src/services/embedding-service.js';
 import { createEnrichmentWorker } from '../../src/services/enrichment-worker.js';
 import { createEdge } from '../../src/services/edge-service.js';
 import { searchEntities } from '../../src/services/search-service.js';
 import { softDeleteEntity, storeEntity } from '../../src/services/entity-service.js';
 import type { AuthContext } from '../../src/auth/types.js';
+import { ErrorCode } from '../../src/util/errors.js';
 import {
   createTestDatabase,
   resetTestDatabase,
@@ -424,6 +428,80 @@ describe('search-service', () => {
     expect(talonContents).not.toContain('Scoped durable memory for Codex only.');
   }, 120_000);
 
+  it('omits entity and related content when hydration is disabled', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const auth = makeAuthContext();
+    const largeContent = `compact retrieval marker ${'x'.repeat(100_000)}`;
+    const stored = (
+      await storeEntity(database.pool, auth, {
+        type: 'document',
+        content: largeContent
+      })
+    )._unsafeUnwrap();
+    const neighbor = (
+      await storeEntity(database.pool, auth, {
+        type: 'project',
+        content: `related content ${'y'.repeat(20_000)}`
+      })
+    )._unsafeUnwrap();
+
+    expect(
+      (
+        await createEdge(database.pool, auth, {
+          sourceId: stored.id,
+          targetId: neighbor.id,
+          relation: 'part_of'
+        })
+      ).isOk()
+    ).toBe(true);
+
+    const embeddingService = createEmbeddingService();
+    await createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService
+    }).runOnce();
+
+    const compact = await searchEntities(
+      database.pool,
+      auth,
+      {
+        query: 'compact retrieval marker',
+        threshold: 0,
+        expandGraph: true,
+        includeContent: false
+      },
+      { embeddingService }
+    );
+    const compactHit = compact
+      ._unsafeUnwrap()
+      .results.find((entry) => entry.entity.id === stored.id);
+
+    expect(compactHit?.chunkContent).toEqual(expect.any(String));
+    expect(compactHit?.chunkContent.length).toBeGreaterThan(0);
+    expect(compactHit?.entity.content).toBeNull();
+    expect(compactHit?.related?.[0]?.entity.content).toBeNull();
+
+    const legacy = await searchEntities(
+      database.pool,
+      auth,
+      {
+        query: 'compact retrieval marker',
+        threshold: 0,
+        expandGraph: true
+      },
+      { embeddingService }
+    );
+    const legacyHit = legacy
+      ._unsafeUnwrap()
+      .results.find((entry) => entry.entity.id === stored.id);
+
+    expect(legacyHit?.entity.content).toBe(largeContent);
+    expect(legacyHit?.related?.[0]?.entity.content).toContain('related content');
+  }, 120_000);
+
   it('keeps other clients session context out of graph-expanded search results', async () => {
     if (!database) {
       throw new Error('test database not initialized');
@@ -677,6 +755,38 @@ describe('search-service', () => {
     // however irrelevant it is. Returning those under the caller's semantic
     // threshold would be worse than returning nothing.
     expect(result.isErr()).toBe(true);
+    expect(result._unsafeUnwrapErr().code).toBe(ErrorCode.EMBEDDING_FAILED);
+  }, 120_000);
+
+  it('bounds persisted query embeddings per client', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const embeddingService = createEmbeddingService({
+      embedQuery: () => Promise.resolve(new Array<number>(1536).fill(0.01))
+    });
+
+    for (const query of ['query one', 'query two', 'query three']) {
+      const result = await searchEntities(
+        database.pool,
+        makeAuthContext(),
+        { query, threshold: 0 },
+        { embeddingService }
+      );
+      expect(result.isOk()).toBe(true);
+    }
+    await embeddingService.flushPendingWrites();
+    const pruned = await pruneQueryEmbeddingCache(database.pool, 30, 2);
+
+    const cached = await database.pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM query_embedding_cache
+       WHERE client_id = $1`,
+      [makeAuthContext().clientId]
+    );
+    expect(pruned).toBe(1);
+    expect(cached.rows[0]?.count).toBe(2);
   }, 120_000);
 
   it('serves a repeated query embedding from Postgres across service instances', async () => {

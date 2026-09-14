@@ -327,9 +327,11 @@ entities are retried up to 3 times with a 5-minute backoff.
 ### 3. Hybrid Search
 
 Search blends vector cosine similarity (60%) with BM25 keyword ranking (40%)
-transparently. Search requires a reachable embedding provider; if that provider
-is unavailable, writes still succeed but enrichment and search fail until it
-recovers. Results include:
+transparently. Broad searches select candidates through the HNSW index; small
+filtered sets use exact distance ranking, and HNSW falls back to exact ranking
+when its candidate scan cannot fill its target. Search requires a reachable
+embedding provider; if that provider is unavailable, writes still succeed but
+enrichment and search fail until it recovers. Results include:
 
 - ranked results with blended scores
 - similarity scores
@@ -642,10 +644,10 @@ those values outside database backups and browser storage.
 | `EMBEDDING_DIMENSIONS` | no                   | per-provider                    | Must match the active `embedding_models` row. Run `./bin/pgm-admin embeddings migrate --target-dimensions <N> --yes` to change. |
 | `EMBEDDING_BASE_URL`   | when provider=ollama | falls back to `OLLAMA_BASE_URL` | Embedding host. Independent from LLM-extraction host so embeddings and inference can target different machines.                 |
 | `EMBEDDING_API_KEY`    | no                   |                                 | Optional bearer token for `EMBEDDING_BASE_URL`.                                                                                 |
-| `EMBEDDING_TIMEOUT_MS` | no                   | `15000`                         | Hard timeout for a single embedding provider call. Bounds how long one stalled request can hold a connection. |
+| `EMBEDDING_TIMEOUT_MS` | no                   | `15000`                         | Hard timeout for a single embedding provider call. Bounds how long one stalled call can delay a request. |
 | `QUERY_EMBEDDING_CACHE_SIZE` | no             | `512`                           | In-process query embeddings held in front of the Postgres-backed cache. |
 | `QUERY_EMBEDDING_CACHE_SECRET` | no           |                                 | Keys the query digest with an HMAC. Without it the digest is an unkeyed sha256, which a reader of the database can dictionary-test to confirm whether a guessed query was run. Set it if you treat query text as more sensitive than entity content; it must live outside the database to mean anything. Changing it invalidates existing cache rows. |
-| `QUERY_EMBEDDING_CACHE_RETENTION_DAYS` | no   | `30`                            | Age at which persisted query embeddings are pruned. |
+| `QUERY_EMBEDDING_CACHE_RETENTION_DAYS` | no   | `30`                            | Age at which persisted query embeddings are pruned. The hourly prune also retains only the 2,000 newest entries per client. |
 
 When Postgram runs in Docker and Ollama runs directly on the Docker host, use `http://host.docker.internal:11434` for `EMBEDDING_BASE_URL`; `localhost` inside the container points at the Postgram container, not the host machine.
 
@@ -847,10 +849,13 @@ export PGM_API_KEY='<plaintext-key>'
 
 ### Search
 
-- `POST /api/search` — hybrid BM25+vector search (supports `expand_graph`)
+- `POST /api/search` — hybrid BM25+vector search (supports `expand_graph` and `include_content`)
 
-REST routes always return full JSON responses. Compact and TOON output are
-transport-layer conveniences for MCP and the CLI only.
+REST search keeps full entity content by default for backwards compatibility.
+Pass `include_content: false` to return matched chunks without hydrating or
+serializing full result and graph-neighbor content. Other REST routes continue
+to return their existing full JSON responses. Compact JSON and TOON remain
+transport-layer conveniences for MCP and the CLI.
 
 ### Tasks
 
@@ -933,17 +938,22 @@ token-heavy outputs default to compact agent-friendly responses:
   writes, `link`) return compact ids/status/version instead of echoing full
   metadata and timestamps
 - `search`, `task_list`, and `expand` return compact rows/graph payloads by
-  default; compact search may include `edges.count` and `edges.relations` as
-  cheap traversal affordances
-- pass `full_response: true` to get the full REST-shaped payload
+  default; compact search contains the matched chunk rather than full result or
+  neighbor content and may include `edges.count` and `edges.relations` as cheap
+  traversal affordances
+- pass `full_response: true` to get the full REST-shaped payload, including
+  complete entity content
 - pass `toon: true` on list-like tools (`search`, `task_list`, `expand`) to
   receive compact TOON text from the MCP layer
 
-Compact `edges` summaries contain counts and relation labels only. They do not
-include neighbor content. Use `expand_graph` or `expand` when the user needs
-causes, provenance, decisions, dependencies, blockers, ownership, involvement,
-discussion participants, connected context, or graph-based disambiguation.
-Avoid expansion for direct facts already present in the compact result.
+Search is the discovery step: inspect compact IDs, scores, and matched chunks,
+then call `recall` only for the selected entities whose complete content is
+needed. Compact `edges` summaries contain counts and relation labels only. They
+do not include neighbor content. Use `expand_graph` or `expand` when the user
+needs causes, provenance, decisions, dependencies, blockers, ownership,
+involvement, discussion participants, connected context, or graph-based
+disambiguation. Avoid expansion for direct facts already present in the matched
+chunk.
 
 The underlying API remains JSON; compacting and TOON happen only in MCP/CLI
 handlers.
@@ -1005,9 +1015,10 @@ pgm store "decided to use pgvector" --type memory --tags decisions
 pgm search "database decisions"
 pgm search "database decisions" --type memory          # filter by entity type
 pgm search "who worked on embeddings" --expand-graph   # include graph neighbours
-pgm search "database decisions" --json                 # compact JSON for agents
-pgm search "database decisions" --json --full-response # full API-shaped JSON
-pgm search "database decisions" --toon                 # compact TOON output
+pgm search "database decisions" --json                 # matched chunks for agents
+pgm search "database decisions" --json --full-response # complete legacy search response
+pgm search "database decisions" --limit 5 --toon       # compact discovery output
+pgm recall <selected-entity-id>                         # complete selected content
 pgm list --json                                        # compact JSON rows
 pgm list --json --full-response                        # full API-shaped rows
 pgm list --toon                                        # compact TOON rows
@@ -1339,7 +1350,9 @@ your global `~/.claude/CLAUDE.md`. A ready-to-use template is provided at
 type filters), how to inspect compact `edges.count`/`edges.relations`, when to
 use `expand_graph`, when to store, when to link, and general principles. Copy
 the relevant sections into your own `CLAUDE.md` and Claude will proactively use
-the MCP tools to persist and recall knowledge without being asked.
+the MCP tools to persist and recall knowledge without being asked. Its default
+retrieval flow is search for compact matched chunks, then recall only the
+selected entities that require complete content.
 
 For coding agents that should avoid broad knowledge-work behavior, use
 [`templates/AGENTS.coding.md`](templates/AGENTS.coding.md) or [`templates/CLAUDE.coding.md`](templates/CLAUDE.coding.md). It narrows Postgram
