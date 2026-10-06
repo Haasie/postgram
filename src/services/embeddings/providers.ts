@@ -1,6 +1,14 @@
-import OpenAI from 'openai';
+import OpenAI, {
+  APIConnectionTimeoutError,
+  APIUserAbortError
+} from 'openai';
 
-import { AppError, ErrorCode } from '../../util/errors.js';
+import {
+  AppError,
+  ErrorCode,
+  RateLimitError,
+  isRateLimitError
+} from '../../util/errors.js';
 
 export type EmbeddingProviderName = 'openai' | 'ollama' | 'openai-compatible';
 
@@ -12,12 +20,16 @@ export interface EmbeddingProvider {
   embedBatch(texts: string[]): Promise<number[][]>;
 }
 
+type ProviderFetch = (input: string, init: RequestInit) => Promise<Response>;
+
 export type EmbeddingProviderConfig =
   | {
       provider: 'openai';
       model: string;
       dimensions: number;
       apiKey: string;
+      timeoutMs?: number | undefined;
+      maxRetries?: number | undefined;
     }
   | {
       provider: 'openai-compatible';
@@ -25,6 +37,9 @@ export type EmbeddingProviderConfig =
       dimensions: number;
       baseUrl: string;
       apiKey?: string | undefined;
+      timeoutMs?: number | undefined;
+      maxRetries?: number | undefined;
+      fetchImpl?: ProviderFetch | undefined;
     }
   | {
       provider: 'ollama';
@@ -32,15 +47,46 @@ export type EmbeddingProviderConfig =
       dimensions: number;
       baseUrl: string;
       apiKey?: string | undefined;
+      timeoutMs?: number | undefined;
+      fetchImpl?: ProviderFetch | undefined;
     };
 
 const OPENAI_DEFAULT_MODEL = 'text-embedding-3-small';
 const OPENAI_DEFAULT_DIMENSIONS = 1536;
 const OLLAMA_DEFAULT_MODEL = 'bge-m3';
 const OLLAMA_DEFAULT_DIMENSIONS = 1024;
-// Mistral Embed uses the same 1024-dimensional space as bge-m3.
+// Mistral Embed produces 1024-dimensional vectors, the same width as bge-m3.
+// The width matches, the vector space does not: switching between the two
+// without re-embedding (pgm-admin embeddings migrate) yields meaningless
+// similarity scores.
 const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed-2312';
 const OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS = 1024;
+// Hosted OpenAI-compatible endpoints cap inputs per request; chunking a large
+// note can yield hundreds of chunks, so page them.
+export const OPENAI_COMPATIBLE_MAX_BATCH_INPUTS = 64;
+// A throttled upstream is better served by the worker's back-off than by SDK
+// retries that multiply requests inside the window being waited out.
+export const OPENAI_COMPATIBLE_DEFAULT_MAX_RETRIES = 0;
+
+// The OpenAI SDK defaults to a 10 minute timeout and 2 retries, which means a
+// single stalled embedding call can pin a request (and a database connection
+// upstream of it) for far longer than any caller is willing to wait. Embedding
+// a short query is a sub-second operation; bound it accordingly.
+export const DEFAULT_EMBEDDING_TIMEOUT_MS = 15_000;
+export const DEFAULT_EMBEDDING_MAX_RETRIES = 2;
+
+// The SDK's `timeout` is applied per HTTP attempt and a timed-out attempt is
+// itself retried, so `timeout` alone bounds an attempt rather than the
+// operation: measured locally, timeout=200/maxRetries=2 took 1974ms to fail.
+// Every provider call therefore also carries an outer AbortSignal, which is
+// what actually makes EMBEDDING_TIMEOUT_MS mean what its name says.
+//
+// Retries are still worth keeping: a fast transient failure (429, 5xx) fails
+// well inside the budget and leaves room to try again. Only slow failures are
+// cut off, which is precisely the case retrying should not extend.
+function embeddingDeadline(timeoutMs: number): AbortSignal {
+  return AbortSignal.timeout(timeoutMs);
+}
 
 export function resolveEmbeddingDefaults(
   provider: EmbeddingProviderName,
@@ -67,12 +113,15 @@ export function resolveEmbeddingDefaults(
 
 type OpenAIEmbeddingClient = {
   embeddings: {
-    create: (params: {
-      model: string;
-      input: string[];
-      encoding_format: 'float';
-      dimensions?: number;
-    }) => Promise<{
+    create: (
+      params: {
+        model: string;
+        input: string[];
+        encoding_format: 'float';
+        dimensions?: number;
+      },
+      options?: { signal?: AbortSignal | undefined }
+    ) => Promise<{
       data: Array<{ index: number; embedding: number[] }>;
     }>;
   };
@@ -80,6 +129,27 @@ type OpenAIEmbeddingClient = {
 
 function embeddingError(message: string, details: Record<string, unknown> = {}): AppError {
   return new AppError(ErrorCode.EMBEDDING_FAILED, message, details);
+}
+
+/**
+ * The deadline surfaces differently depending on where it fires. The OpenAI SDK
+ * wraps an aborted signal as APIUserAbortError and an exhausted per-attempt
+ * timeout as APIConnectionTimeoutError; neither sets a useful `name`, so they
+ * are matched by class. A bare fetch instead rejects with a DOMException named
+ * AbortError or TimeoutError.
+ */
+function isAbortError(error: unknown): boolean {
+  if (
+    error instanceof APIUserAbortError ||
+    error instanceof APIConnectionTimeoutError
+  ) {
+    return true;
+  }
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const name = (error as { name?: unknown }).name;
+  return name === 'AbortError' || name === 'TimeoutError';
 }
 
 function assertVectorShape(
@@ -102,24 +172,35 @@ export function createOpenAIEmbeddingProvider(
   config: Extract<EmbeddingProviderConfig, { provider: 'openai' }>,
   clientOverride?: OpenAIEmbeddingClient
 ): EmbeddingProvider {
-  const client = clientOverride ?? new OpenAI({ apiKey: config.apiKey });
+  const client =
+    clientOverride ??
+    new OpenAI({
+      apiKey: config.apiKey,
+      timeout: config.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS,
+      maxRetries: config.maxRetries ?? DEFAULT_EMBEDDING_MAX_RETRIES
+    });
 
   async function embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) {
       return [];
     }
 
+    const timeoutMs = config.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS;
+
     try {
       // Pass `dimensions` to OpenAI when the operator has chosen a non-default
       // size. text-embedding-3-small/large accept this parameter and truncate
       // via Matryoshka; older models (ada-002) will reject it at the API.
       const nonDefaultDimensions = config.dimensions !== OPENAI_DEFAULT_DIMENSIONS;
-      const response = await client.embeddings.create({
-        model: config.model,
-        input: texts,
-        encoding_format: 'float',
-        ...(nonDefaultDimensions ? { dimensions: config.dimensions } : {})
-      });
+      const response = await client.embeddings.create(
+        {
+          model: config.model,
+          input: texts,
+          encoding_format: 'float',
+          ...(nonDefaultDimensions ? { dimensions: config.dimensions } : {})
+        },
+        { signal: embeddingDeadline(timeoutMs) }
+      );
 
       const ordered = response.data
         .slice()
@@ -144,8 +225,17 @@ export function createOpenAIEmbeddingProvider(
       if (error instanceof AppError) {
         throw error;
       }
+      if (isAbortError(error)) {
+        throw embeddingError(
+          `OpenAI embedding call timed out after ${timeoutMs}ms`,
+          { provider: 'openai', model: config.model, timeoutMs }
+        );
+      }
       const message =
         error instanceof Error ? error.message : 'OpenAI embedding call failed';
+      if (isRateLimitError(error)) {
+        throw new RateLimitError(message, { cause: error });
+      }
       throw embeddingError(message, {
         provider: 'openai',
         model: config.model
@@ -179,6 +269,24 @@ export function createOllamaEmbeddingProvider(
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
 
   async function callOllama(prompt: string): Promise<number[]> {
+    // The timer spans the body read as well as the headers: fetch resolves as
+    // soon as headers arrive, so clearing it earlier would leave a stalled
+    // response body unbounded.
+    const timeoutMs = config.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await callOllamaWithSignal(prompt, controller, timeoutMs);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function callOllamaWithSignal(
+    prompt: string,
+    controller: AbortController,
+    timeoutMs: number
+  ): Promise<number[]> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json'
     };
@@ -188,12 +296,19 @@ export function createOllamaEmbeddingProvider(
 
     let response: Response;
     try {
-      response = await fetch(`${baseUrl}/api/embeddings`, {
+      response = await (config.fetchImpl ?? fetch)(`${baseUrl}/api/embeddings`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ model: config.model, prompt })
+        body: JSON.stringify({ model: config.model, prompt }),
+        signal: controller.signal
       });
     } catch (error) {
+      if (controller.signal.aborted) {
+        throw embeddingError(
+          `Ollama embedding call timed out after ${timeoutMs}ms`,
+          { provider: 'ollama', model: config.model, baseUrl, timeoutMs }
+        );
+      }
       const message =
         error instanceof Error ? error.message : 'Ollama embedding call failed';
       throw embeddingError(`Ollama provider unreachable: ${message}`, {
@@ -217,7 +332,24 @@ export function createOllamaEmbeddingProvider(
       );
     }
 
-    const body = (await response.json()) as { embedding?: number[] };
+    let body: { embedding?: number[] };
+    try {
+      body = (await response.json()) as { embedding?: number[] };
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw embeddingError(
+          `Ollama embedding call timed out after ${timeoutMs}ms`,
+          { provider: 'ollama', model: config.model, baseUrl, timeoutMs }
+        );
+      }
+      const message =
+        error instanceof Error ? error.message : 'Invalid JSON from Ollama';
+      throw embeddingError(`Ollama returned an unreadable response: ${message}`, {
+        provider: 'ollama',
+        model: config.model,
+        baseUrl
+      });
+    }
     if (!body.embedding) {
       throw embeddingError('Ollama response missing embedding field', {
         provider: 'ollama',
@@ -261,45 +393,85 @@ async function safeReadSnippet(response: Response): Promise<string> {
 }
 
 export function createOpenAICompatibleEmbeddingProvider(
-  config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>
+  config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>,
+  clientOverride?: OpenAIEmbeddingClient
 ): EmbeddingProvider {
-  // Use the OpenAI SDK with a custom base URL — Mistral, together.ai, etc.
-  const client = new OpenAI({
-    apiKey: config.apiKey ?? 'dummy', // some servers don't require a key
-    baseURL: config.baseUrl.replace(/\/+$/, '')
-  }) as OpenAIEmbeddingClient;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS;
+  // Mistral, together.ai, vLLM, ... all speak the OpenAI embeddings protocol.
+  // A missing key is not papered over with a dummy bearer token: keyless
+  // servers get no Authorization header at all.
+  const client =
+    clientOverride ??
+    (new OpenAI({
+      apiKey: config.apiKey ?? 'unused',
+      baseURL: config.baseUrl.replace(/\/+$/, ''),
+      timeout: timeoutMs,
+      maxRetries: config.maxRetries ?? OPENAI_COMPATIBLE_DEFAULT_MAX_RETRIES,
+      ...(config.apiKey ? {} : { defaultHeaders: { Authorization: null } }),
+      ...(config.fetchImpl
+        ? { fetch: config.fetchImpl as unknown as typeof fetch }
+        : {})
+    }) as OpenAIEmbeddingClient);
+
+  async function embedPage(texts: string[]): Promise<number[][]> {
+    const response = await client.embeddings.create(
+      {
+        model: config.model,
+        input: texts,
+        encoding_format: 'float'
+      },
+      { signal: embeddingDeadline(timeoutMs) }
+    );
+    const ordered = response.data
+      .slice()
+      .sort((left, right) => left.index - right.index)
+      .map((item) => item.embedding);
+
+    if (ordered.length !== texts.length) {
+      throw embeddingError('Embedding API returned an unexpected number of vectors', {
+        provider: 'openai-compatible',
+        model: config.model,
+        expected: texts.length,
+        actual: ordered.length
+      });
+    }
+    for (const vector of ordered) {
+      assertVectorShape(vector, config.dimensions, 'openai-compatible', config.model);
+    }
+    return ordered;
+  }
 
   async function embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) {
       return [];
     }
     try {
-      const response = await client.embeddings.create({
-        model: config.model,
-        input: texts,
-        encoding_format: 'float'
-      });
-      const ordered = response.data
-        .slice()
-        .sort((left, right) => left.index - right.index)
-        .map((item) => item.embedding);
-
-      if (ordered.length !== texts.length) {
-        throw embeddingError('Embedding API returned an unexpected number of vectors', {
-          provider: 'openai-compatible',
-          model: config.model,
-          expected: texts.length,
-          actual: ordered.length
-        });
+      const vectors: number[][] = [];
+      for (
+        let offset = 0;
+        offset < texts.length;
+        offset += OPENAI_COMPATIBLE_MAX_BATCH_INPUTS
+      ) {
+        vectors.push(
+          ...(await embedPage(
+            texts.slice(offset, offset + OPENAI_COMPATIBLE_MAX_BATCH_INPUTS)
+          ))
+        );
       }
-      for (const vector of ordered) {
-        assertVectorShape(vector, config.dimensions, 'openai-compatible', config.model);
-      }
-      return ordered;
+      return vectors;
     } catch (error) {
-      if (error instanceof AppError) throw error;
+      if (error instanceof AppError || error instanceof RateLimitError) throw error;
+      if (isAbortError(error)) {
+        throw embeddingError(
+          `OpenAI-compatible embedding call timed out after ${timeoutMs}ms`,
+          { provider: 'openai-compatible', model: config.model, timeoutMs }
+        );
+      }
       const message =
         error instanceof Error ? error.message : 'OpenAI-compatible embedding call failed';
+      if (isRateLimitError(error)) {
+        throw new RateLimitError(message, { cause: error });
+      }
       throw embeddingError(message, {
         provider: 'openai-compatible',
         model: config.model,

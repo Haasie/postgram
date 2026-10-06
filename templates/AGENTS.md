@@ -22,22 +22,35 @@ All entity types are searchable: `memory`, `person`, `project`, `task`,
 
 MCP outputs are compact by default for agent token efficiency on token-heavy
 tools: search, task lists, graph expansion, write acknowledgements, and link
-acknowledgements. Use `"full_response": true` only when you need metadata,
-timestamps, raw similarity, version history context, or the legacy nested entity
-shape. Use `"toon": true` on list-like tools (`search`, `task_list`, `expand`)
-for the smallest readable MCP output.
+acknowledgements. Search returns ranked matched chunks without complete result
+or neighbor content. Recall a selected entity by ID when you need its complete
+content. Use `"full_response": true` only when a machine consumer needs
+metadata, timestamps, raw similarity, version history context, and the complete
+legacy envelope. Use `"toon": true` on list-like tools (`search`, `task_list`,
+`expand`) for the smallest readable MCP output.
 
 ### When to use expand_graph
 
+Start with compact search. If a result has `edges.count > 0`, inspect
+`edges.relations` before deciding whether to traverse. The `edges` field is a
+cheap affordance: it tells you graph context exists without returning neighbor
+content.
+
 Add `"expand_graph": true` when relationships matter — not just finding a
-document, but understanding what is connected to it. Each result gains a
-`related` array of graph-connected entities with `relation` and `direction`.
+document, but understanding what is connected to it. Each expanded result gains
+a `related` array of graph-connected entity IDs with `type`, `relation`, and
+`direction`; recall a selected neighbor when its content is needed.
 
 Use it when the user asks:
 
 - Who was involved in X / who owns Y
 - What led to a decision, what depends on something
 - What else is connected to a topic (open-ended exploration)
+- Causes, provenance, blockers, or discussion participants
+- Similar search hits need graph context for disambiguation
+
+Do not expand when the user only needs a direct fact from the compact result.
+Keep traversal deliberate to control token use.
 
 ```
 mcp__postgram__search { "query": "authentication design", "limit": 3, "expand_graph": true }

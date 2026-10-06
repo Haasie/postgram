@@ -2,6 +2,7 @@
   "name": "postgram",
   "version": "0.1.3",
   "private": true,
+  "license": "AGPL-3.0-only",
   "type": "module",
   "workspaces": [
     "cli",
@@ -22,6 +23,9 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
+    "benchmark:search": "tsx benchmarks/search-latency.ts",
+    "benchmark:auth": "tsx benchmarks/auth-verification.ts",
+    "benchmark:contention": "tsx benchmarks/enrichment-contention.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "migrate": "tsx src/db/migrate.ts"

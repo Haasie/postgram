@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
@@ -28,7 +29,10 @@ async function runPgm(args: string[], env: NodeJS.ProcessEnv) {
   return execFileAsync(TSX_BIN, [PGM_ENTRYPOINT, ...args], {
     env: {
       ...process.env,
-      ...env
+      ...env,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, '--no-deprecation']
+        .filter(Boolean)
+        .join(' ')
     },
     cwd: process.cwd(),
     maxBuffer: 10_000_000,
@@ -42,7 +46,10 @@ async function runPgmCapture(args: string[], env: NodeJS.ProcessEnv) {
       const child = spawn(TSX_BIN, [PGM_ENTRYPOINT, ...args], {
         env: {
           ...process.env,
-          ...env
+          ...env,
+          NODE_OPTIONS: [process.env.NODE_OPTIONS, '--no-deprecation']
+            .filter(Boolean)
+            .join(' ')
         },
         cwd: process.cwd()
       });
@@ -913,6 +920,70 @@ describe('pgm CLI', () => {
     expect(expandBody.edges).toHaveLength(1);
   }, 120_000);
 
+  it('requests chunk-only search unless full response is selected', async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const app = new Hono();
+    app.post('/api/search', async (context) => {
+      requestBodies.push(await context.req.json());
+      return context.json({
+        results: [
+          {
+            entity: {
+              id: '01234567-89ab-cdef-0123-456789abcdef',
+              type: 'document',
+              content: 'full entity content must stay hidden'
+            },
+            chunk_content: 'matched chunk',
+            similarity: 0.9,
+            score: 0.8
+          }
+        ]
+      });
+    });
+
+    let fakeBaseUrl = '';
+    const fakeServer = serve(
+      { fetch: app.fetch, hostname: '127.0.0.1', port: 0 },
+      (info) => {
+        fakeBaseUrl = `http://${info.address}:${info.port}`;
+      }
+    );
+    await vi.waitFor(() => expect(fakeBaseUrl).not.toBe(''));
+
+    try {
+      const env = {
+        PGM_API_URL: fakeBaseUrl,
+        PGM_API_KEY: 'test-key'
+      };
+      await runPgm(['search', 'compact retrieval', '--json'], env);
+      await runPgm(
+        ['search', 'compact retrieval', '--json', '--full-response'],
+        env
+      );
+      const humanResult = await runPgm(['search', 'compact retrieval'], env);
+      expect(humanResult.stdout).toContain('matched chunk');
+      expect(humanResult.stdout).not.toContain(
+        'full entity content must stay hidden'
+      );
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        fakeServer.close((error) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    expect(requestBodies.map((body) => body.include_content)).toEqual([
+      false,
+      true,
+      false
+    ]);
+  }, 120_000);
+
   it('supports full-response, TOON, and discoverable help for search output', async () => {
     if (!database) {
       throw new Error('test database not initialized');
@@ -957,7 +1028,6 @@ describe('pgm CLI', () => {
       results: Array<{
         id: string;
         type: string;
-        content: string | null;
         chunk: string;
         score: number;
       }>;
@@ -969,9 +1039,9 @@ describe('pgm CLI', () => {
     expect(firstCompactResult).toMatchObject({
       id: stored.id,
       type: 'memory',
-      content: 'token compact search response shape',
       chunk: 'token compact search response shape'
     });
+    expect(firstCompactResult).not.toHaveProperty('content');
     expect(typeof firstCompactResult.score).toBe('number');
 
     const fullResult = await runPgm(
@@ -987,12 +1057,19 @@ describe('pgm CLI', () => {
     );
     const full = parseJson(fullResult.stdout) as {
       results: Array<{
-        entity: { id: string; metadata: Record<string, unknown> };
+        entity: {
+          id: string;
+          content: string | null;
+          metadata: Record<string, unknown>;
+        };
         chunk_content: string;
         similarity: number;
       }>;
     };
     expect(full.results[0]?.entity.id).toBe(stored.id);
+    expect(full.results[0]?.entity.content).toBe(
+      'token compact search response shape'
+    );
     expect(full.results[0]?.chunk_content).toContain('compact search');
     expect(full.results[0]?.similarity).toEqual(expect.any(Number));
 
@@ -1001,14 +1078,23 @@ describe('pgm CLI', () => {
       env
     );
     expect(toonResult.stdout).toContain(
-      'results[1]{id,type,score,content,chunk,tags,related}:'
+      'results[1]{id,type,score,chunk,tags,edges,related}:'
     );
     expect(toonResult.stdout).toContain(stored.id);
     expect(toonResult.stdout).not.toContain('created_at');
 
+    const humanResult = await runPgm(
+      ['search', 'compact search', '--threshold', '0'],
+      env
+    );
+    expect(humanResult.stdout).toContain('token compact search response shape');
+    expect(humanResult.stdout).not.toContain('entity:');
+
     const helpResult = await runPgm(['search', '--help'], env);
     expect(helpResult.stdout).toContain('--full-response');
-    expect(helpResult.stdout).toContain('emit the full API response');
+    expect(helpResult.stdout).toMatch(
+      /emit the full API response with complete\s+entity content/u
+    );
     expect(helpResult.stdout).toContain('--toon');
     expect(helpResult.stdout).toContain('emit compact TOON output');
   }, 120_000);
@@ -1108,13 +1194,38 @@ describe('pgm CLI', () => {
       }
     });
 
+    const literalVersionResult = await runPgm(
+      [
+        'task',
+        'update',
+        addBody.entity.id,
+        '--version',
+        String(updateBody.entity.version),
+        '--content',
+        '--version',
+        '--json',
+        '--full-response'
+      ],
+      {
+        PGM_API_URL: baseUrl,
+        PGM_API_KEY: createdKey.plaintextKey
+      }
+    );
+    const literalVersionBody = parseJson(literalVersionResult.stdout) as {
+      entity: {
+        version: number;
+        content: string;
+      };
+    };
+    expect(literalVersionBody.entity.content).toBe('--version');
+
     const completeResult = await runPgm(
       [
         'task',
         'complete',
         addBody.entity.id,
         '--version',
-        String(updateBody.entity.version),
+        String(literalVersionBody.entity.version),
         '--json',
         '--full-response'
       ],

@@ -42,6 +42,15 @@ function readCliVersion(): string {
   return packageJson.version;
 }
 
+function printTopLevelVersionAndExit(argv: string[]): void {
+  if (argv.length === 3 && (argv[2] === '--version' || argv[2] === '-V')) {
+    process.stdout.write(`${readCliVersion()}\n`);
+    process.exit(0);
+  }
+}
+
+printTopLevelVersionAndExit(process.argv);
+
 function formatStoredEntity(entity: {
   id: string;
   type: string;
@@ -62,14 +71,13 @@ function formatStoredEntity(entity: {
 
 function formatSearchResults(
   results: Array<{
-    entity: { id: string; type: string; content: string | null };
+    entity: { id: string; type: string };
     score: number;
     chunk_content: string;
     related?: Array<{
       entity: {
         id: string;
         type: string;
-        content: string | null;
         metadata: Record<string, unknown>;
       };
       relation: string;
@@ -87,12 +95,6 @@ function formatSearchResults(
       `${result.entity.type} ${shortId(result.entity.id)} score=${result.score.toFixed(3)}`
     );
     lines.push(`  ${result.chunk_content}`);
-    if (
-      result.entity.content &&
-      result.entity.content !== result.chunk_content
-    ) {
-      lines.push(`  entity: ${result.entity.content}`);
-    }
     if (result.related && result.related.length > 0) {
       lines.push(`  related (${result.related.length}):`);
       for (const rel of result.related) {
@@ -407,7 +409,6 @@ const program = new Command();
 program
   .name('pgm')
   .description('Postgram CLI for humans and agents')
-  .version(readCliVersion())
   .option('--json', 'emit compact JSON for agents where supported');
 
 program
@@ -460,7 +461,9 @@ program
 
 program
   .command('search')
-  .description('Search stored entities (compact JSON with --json; TOON with --toon)')
+  .description(
+    'Search stored entities (chunks by default; full content with --json --full-response)'
+  )
   .argument('query', 'search query')
   .option('--type <type>', 'entity type')
   .option('--tags <tags>', 'comma-separated tags')
@@ -477,7 +480,7 @@ program
   )
   .option(
     '--full-response',
-    'emit the full API response instead of compact default output when used with --json'
+    'emit the full API response with complete entity content when used with --json'
   )
   .option(
     '--toon',
@@ -513,7 +516,8 @@ program
         recency_weight: Number(options.recencyWeight),
         expand_graph: options.expandGraph === true ? true : undefined,
         include_archived: options.includeArchived === true ? true : undefined,
-        memory_role: options.memoryRole
+        memory_role: options.memoryRole,
+        include_content: options.fullResponse === true
       });
 
       if (options.toon === true) {

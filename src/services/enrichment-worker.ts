@@ -2,6 +2,7 @@ import type { Logger } from 'pino';
 import type { Pool, PoolClient } from 'pg';
 
 import type { AuthContext } from '../auth/types.js';
+import { isRateLimitError } from '../util/errors.js';
 import { createLogger } from '../util/logger.js';
 import { chunkText } from './chunking-service.js';
 import {
@@ -13,36 +14,6 @@ import {
   SemanticMatchUnavailableError
 } from './extraction-service.js';
 import { getMemoryRole } from './memory-role-service.js';
-
-/**
- * Signals that the upstream LLM API returned HTTP 429 (Too Many Requests).
- * The worker treats this as a transient condition and leaves the entity in
- * `pending` state so it will be retried in the next poll cycle after a
- * back-off delay, rather than marking it permanently `failed`.
- */
-export class RateLimitError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'RateLimitError';
-  }
-}
-
-/**
- * Returns true when an error originates from an HTTP 429 response.
- * Matches the error message format produced by createOpenAiProvider and
- * other providers in llm-provider.ts.
- */
-function isRateLimitError(error: unknown): boolean {
-  if (error instanceof RateLimitError) return true;
-  if (error instanceof Error) {
-    return (
-      error.message.includes('429') ||
-      error.message.toLowerCase().includes('rate limit') ||
-      error.message.toLowerCase().includes('rate_limited')
-    );
-  }
-  return false;
-}
 
 type PendingEntityRow = {
   id: string;
@@ -396,7 +367,11 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
 
   async function processNextExtractionEntity(
     extractionAuth: AuthContext
-  ): Promise<boolean> {
+  ): Promise<{ more: boolean; rateLimited: boolean }> {
+    // Set when any candidate in this batch hit an upstream 429. The batch is
+    // still drained so one throttled entity cannot starve the ones behind it;
+    // the caller pauses once the batch is done.
+    let rateLimited = false;
     // Do NOT hold a long row-level `FOR UPDATE` across the LLM call.
     // createEdge (called inside extractAndLinkRelationships) runs on a
     // different pool connection, and its INSERT INTO edges needs a FK
@@ -417,12 +392,13 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
     );
 
     if (candidates.rows.length === 0) {
-      return false;
+      return { more: false, rateLimited };
     }
 
     const lockClient = await options.pool.connect();
     try {
       for (const entity of candidates.rows) {
+        let entityRateLimited = false;
         const lockRes = await lockClient.query<{ locked: boolean }>(
           'SELECT pg_try_advisory_lock(hashtext($1)) AS locked',
           [entity.id]
@@ -455,7 +431,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
               .query('SELECT pg_advisory_unlock(hashtext($1))', [entity.id])
               .catch(() => undefined);
           }
-          return true;
+          return { more: true, rateLimited };
         }
 
         const entityCallLlm = resolveCallLlm(
@@ -519,14 +495,18 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
               'extraction deferred — embeddings unavailable, will retry'
             );
           } else if (isRateLimitError(error)) {
-            // 429 from the LLM API is transient — leave the entity pending
-            // so it is retried after the back-off delay. Throwing propagates
-            // out of processNextExtractionEntity so the caller knows to pause.
+            // Both branches above are explicit types; this one is matched on
+            // HTTP status only (never message text), so a SemanticMatch error
+            // wrapping a 429 still takes the branch above.
+            //
+            // 429 is transient: leave the entity pending (no attempt counted,
+            // no extraction_error) and keep going with the rest of the batch.
             logger.warn(
               { entityId: entity.id },
               'extraction deferred — LLM rate limit (429), will back off and retry'
             );
-            throw error;
+            rateLimited = true;
+            entityRateLimited = true;
           } else {
             logger.warn(
               { err: error, entityId: entity.id },
@@ -544,9 +524,13 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
             .query('SELECT pg_advisory_unlock(hashtext($1))', [entity.id])
             .catch(() => undefined);
         }
-        return true;
+        if (!entityRateLimited) {
+          // One entity handled per call. A rate-limited entity did not count
+          // as handled, so move on to the next candidate instead.
+          return { more: true, rateLimited };
+        }
       }
-      return false;
+      return { more: true, rateLimited };
     } finally {
       lockClient.release();
     }
@@ -584,17 +568,18 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
           allowedVisibility: ['personal', 'work', 'shared'] as const
         };
 
-        try {
-          while (await processNextExtractionEntity(extractionAuth)) {
-            processed += 1;
+        for (;;) {
+          const step = await processNextExtractionEntity(extractionAuth);
+          if (!step.more) {
+            break;
           }
-        } catch (error) {
-          if (isRateLimitError(error)) {
+          if (step.rateLimited) {
+            // The batch was drained; the oldest pending rows would be picked
+            // again immediately, so hand control back for the back-off.
             rateLimited = true;
-            return { processed, rateLimited };
-          } else {
-            throw error;
+            break;
           }
+          processed += 1;
         }
       }
 

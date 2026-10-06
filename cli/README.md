@@ -31,10 +31,11 @@ pgm store "decided to use pgvector" --type memory --tags "decisions,architecture
 # Search with human output
 pgm search "pgvector decisions" --limit 5
 
-# Agent-friendly output formats
-pgm search "pgvector decisions" --json                 # compact JSON by default
-pgm search "pgvector decisions" --json --full-response # full API-shaped JSON
-pgm search "pgvector decisions" --toon                 # compact TOON output
+# Agent-friendly discovery, then selective full retrieval
+pgm search "pgvector decisions" --limit 5 --json       # matched chunks by default
+pgm search "pgvector decisions" --limit 5 --toon       # smallest discovery output
+pgm recall <selected-entity-id>                         # complete selected content
+pgm search "pgvector decisions" --json --full-response # complete legacy response
 pgm list --json                                        # compact JSON rows
 pgm list --json --full-response                        # full API-shaped rows
 pgm list --toon                                        # compact TOON rows
@@ -75,19 +76,40 @@ pgm store "hello" --json
 ```
 
 Agent-facing `--json` output is compact by default for search, list, task list,
-graph expansion, write acknowledgements, and link acknowledgements. It omits
-token-heavy fields such as timestamps, metadata, nested `entity` objects, and
-raw similarity unless you pass `--full-response`. Use `--toon` on list-like
+graph expansion, write acknowledgements, and link acknowledgements. Search
+returns identifiers, scores, matched chunks, tags, and edge summaries without
+complete result or graph-neighbor content. Select an ID from those chunks and
+use `pgm recall <id>` when complete content is needed. Other compact outputs
+omit token-heavy fields such as timestamps, metadata, nested `entity` objects,
+and raw similarity unless you pass `--full-response`. Use `--toon` on list-like
 commands (`search`, `list`, `task list`, `expand`) when an agent needs the
 smallest readable output. TOON and compacting are CLI-layer formats; the
 Postgram API remains JSON.
+
+Compact search may include an `edges` summary:
+
+```json
+"edges": {
+  "count": 3,
+  "relations": [{ "relation": "mentioned_in", "count": 2 }]
+}
+```
+
+`edges.count` and `edges.relations` are traversal affordances. They tell an
+agent that graph context exists without returning neighbor content. Use
+`--full-response` only when a machine consumer needs the complete legacy search
+envelope, not as a substitute for recalling one selected result. Use
+`--expand-graph` or `pgm expand <entity-id>` when the user asks about causes,
+provenance, decisions, dependencies, blockers, ownership, involvement,
+discussion participants, connected context, or ambiguous search hits. Do not
+expand when the compact result already answers a direct fact.
 
 ## Memory Roles
 
 Store durable memory:
 
 ```bash
-pgm store "Ivo prefers client-scoped session context in Postgram." \
+pgm store "The user prefers client-scoped session context in Postgram." \
   --type memory \
   --visibility personal \
   --metadata '{"memory_role":"durable_memory"}'
