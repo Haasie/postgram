@@ -190,6 +190,12 @@ const configSchema = z
       emptyToUndefined,
       z.coerce.number().min(0).max(1).default(0.65)
     ),
+    // How long the enrichment worker pauses after an upstream HTTP 429
+    // (embedding or extraction). Applies to both phases. 0 disables the pause.
+    EXTRACTION_RATE_LIMIT_BACKOFF_MS: z.preprocess(
+      emptyToUndefined,
+      z.coerce.number().int().min(0).default(60_000)
+    ),
     ANTHROPIC_API_KEY: optionalString,
     OLLAMA_API_KEY: optionalString,
     OLLAMA_BASE_URL: z.preprocess(
@@ -206,46 +212,6 @@ const configSchema = z
     EMBEDDING_API_KEY: optionalString
   })
   .superRefine((cfg, ctx) => {
-    const needsOpenAiForEmbedding = cfg.EMBEDDING_PROVIDER === 'openai';
-    const needsBaseUrlForOpenAiCompatibleEmbedding =
-      cfg.EMBEDDING_PROVIDER === 'openai-compatible' && !cfg.EMBEDDING_BASE_URL;
-    const needsOpenAiForExtraction =
-      cfg.EXTRACTION_ENABLED && cfg.EXTRACTION_PROVIDER === 'openai';
-    const needsBaseUrlForOpenAiCompatible =
-      cfg.EXTRACTION_ENABLED
-      && cfg.EXTRACTION_PROVIDER === 'openai-compatible'
-      && !cfg.EXTRACTION_BASE_URL;
-
-    if ((needsOpenAiForEmbedding || needsOpenAiForExtraction) && !cfg.OPENAI_API_KEY) {
-      const reasons: string[] = [];
-      if (needsOpenAiForEmbedding) {
-        reasons.push('EMBEDDING_PROVIDER=openai');
-      }
-      if (needsOpenAiForExtraction) {
-        reasons.push('EXTRACTION_ENABLED=true with EXTRACTION_PROVIDER=openai');
-      }
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['OPENAI_API_KEY'],
-        message: `OPENAI_API_KEY is required because ${reasons.join(' and ')}`
-      });
-    }
-
-    if (needsBaseUrlForOpenAiCompatible) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['EXTRACTION_BASE_URL'],
-        message: 'EXTRACTION_BASE_URL is required for EXTRACTION_PROVIDER=openai-compatible'
-      });
-    }
-
-    if (needsBaseUrlForOpenAiCompatibleEmbedding) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['EMBEDDING_BASE_URL'],
-        message: 'EMBEDDING_BASE_URL is required for EMBEDDING_PROVIDER=openai-compatible'
-      });
-    }
     if (cfg.OAUTH_ENABLED && !cfg.PUBLIC_BASE_URL) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

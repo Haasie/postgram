@@ -6,7 +6,7 @@ import type {
   EmbeddingService
 } from './embedding-service.js';
 import { vectorToSql } from './embedding-service.js';
-import { isRateLimitError } from './enrichment-worker.js';
+import { isRateLimitError } from '../util/errors.js';
 
 type ExtractionResult = {
   targetName: string;
@@ -373,6 +373,7 @@ export type ExtractionSource = {
 
 type FindMatchParams = {
   targetName: string;
+  /** Pre-computed embedding of `targetName`; skips the per-target embed call. */
   targetVector?: number[] | undefined;
   /**
    * null means the LLM did not supply a valid target_type. In that case the
@@ -520,9 +521,12 @@ export async function findMatchingEntityByName(
   if (!vector) {
     try {
       [vector] = await embeddingService.embedBatch([params.targetName], activeModel);
-    } catch (err) {
-      if (isRateLimitError(err)) {
-        throw err;
+    } catch (error) {
+      // A 429 is not an outage to degrade around: surface it so the worker
+      // leaves the entity pending and backs off, rather than burning through
+      // every remaining target against a throttled API.
+      if (isRateLimitError(error)) {
+        throw error;
       }
       return { id: null, reason: 'semantic_skipped' };
     }
@@ -707,27 +711,28 @@ export async function extractAndLinkRelationships(
 
   let deferredCount = 0;
 
+  // Embed all distinct target names in one request instead of one request per
+  // target: fewer calls against a rate-limited API. Failures other than 429
+  // fall back to the per-target path (and its semantic_skipped handling).
+  const targetVectors = new Map<string, number[]>();
   const candidateTargets = Array.from(
     new Set(extractions.map((e) => e.targetName).filter(Boolean))
   );
-  const targetVectorMap = new Map<string, number[]>();
-  if (candidateTargets.length > 0) {
+  if (candidateTargets.length > 1) {
     try {
-      const activeModel = await getActiveModel();
       const vectors = await embeddingService.embedBatch(
         candidateTargets,
-        activeModel
+        await getActiveModel()
       );
-      for (let i = 0; i < candidateTargets.length; i++) {
-        const target = candidateTargets[i];
-        const vec = vectors[i];
-        if (target && vec) {
-          targetVectorMap.set(target, vec);
+      candidateTargets.forEach((name, i) => {
+        const vector = vectors[i];
+        if (vector) {
+          targetVectors.set(name, vector);
         }
-      }
-    } catch (err) {
-      if (isRateLimitError(err)) {
-        throw err;
+      });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        throw error;
       }
     }
   }
@@ -756,7 +761,7 @@ export async function extractAndLinkRelationships(
     const matchResult = await findMatchingEntityByName(pool, embeddingService, {
       targetName: extraction.targetName,
       targetType: extraction.targetType,
-      targetVector: targetVectorMap.get(extraction.targetName),
+      targetVector: targetVectors.get(extraction.targetName),
       sourceId: source.id,
       minSimilarity,
       getActiveModel
@@ -893,7 +898,7 @@ export async function extractAndLinkRelationships(
     }
   }
 
-  if (deferredCount > 0 && linked === 0) {
+  if (deferredCount > 0) {
     throw new SemanticMatchUnavailableError(linked);
   }
 

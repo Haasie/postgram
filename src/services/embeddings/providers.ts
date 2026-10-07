@@ -3,7 +3,12 @@ import OpenAI, {
   APIUserAbortError
 } from 'openai';
 
-import { AppError, ErrorCode } from '../../util/errors.js';
+import {
+  AppError,
+  ErrorCode,
+  RateLimitError,
+  isRateLimitError
+} from '../../util/errors.js';
 
 export type EmbeddingProviderName = 'openai' | 'ollama' | 'openai-compatible';
 
@@ -32,6 +37,9 @@ export type EmbeddingProviderConfig =
       dimensions: number;
       baseUrl: string;
       apiKey?: string | undefined;
+      timeoutMs?: number | undefined;
+      maxRetries?: number | undefined;
+      fetchImpl?: ProviderFetch | undefined;
     }
   | {
       provider: 'ollama';
@@ -47,9 +55,18 @@ const OPENAI_DEFAULT_MODEL = 'text-embedding-3-small';
 const OPENAI_DEFAULT_DIMENSIONS = 1536;
 const OLLAMA_DEFAULT_MODEL = 'bge-m3';
 const OLLAMA_DEFAULT_DIMENSIONS = 1024;
-// Mistral Embed uses the same 1024-dimensional space as bge-m3.
-const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed';
+// Mistral Embed produces 1024-dimensional vectors, the same width as bge-m3.
+// The width matches, the vector space does not: switching between the two
+// without re-embedding (pgm-admin embeddings migrate) yields meaningless
+// similarity scores.
+const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed-2312';
 const OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS = 1024;
+// Hosted OpenAI-compatible endpoints cap inputs per request; chunking a large
+// note can yield hundreds of chunks, so page them.
+export const OPENAI_COMPATIBLE_MAX_BATCH_INPUTS = 64;
+// A throttled upstream is better served by the worker's back-off than by SDK
+// retries that multiply requests inside the window being waited out.
+export const OPENAI_COMPATIBLE_DEFAULT_MAX_RETRIES = 0;
 
 // The OpenAI SDK defaults to a 10 minute timeout and 2 retries, which means a
 // single stalled embedding call can pin a request (and a database connection
@@ -216,6 +233,9 @@ export function createOpenAIEmbeddingProvider(
       }
       const message =
         error instanceof Error ? error.message : 'OpenAI embedding call failed';
+      if (isRateLimitError(error)) {
+        throw new RateLimitError(message, { cause: error });
+      }
       throw embeddingError(message, {
         provider: 'openai',
         model: config.model
@@ -372,68 +392,92 @@ async function safeReadSnippet(response: Response): Promise<string> {
   }
 }
 
-// Mistral (and many other openai-compatible providers) cap the number of
-// inputs and total tokens per embeddings request. Using 64 as a safe default
-// avoids 400 errors on large documents that produce hundreds of chunks.
-const OPENAI_COMPATIBLE_MAX_BATCH_SIZE = 64;
-
 export function createOpenAICompatibleEmbeddingProvider(
-  config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>
+  config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>,
+  clientOverride?: OpenAIEmbeddingClient
 ): EmbeddingProvider {
-  // Use the OpenAI SDK with a custom base URL — Mistral, together.ai, etc.
-  const client = new OpenAI({
-    apiKey: config.apiKey ?? 'dummy', // some servers don't require a key
-    baseURL: config.baseUrl.replace(/\/+$/, '')
-  }) as OpenAIEmbeddingClient;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS;
+  // Mistral, together.ai, vLLM, ... all speak the OpenAI embeddings protocol.
+  // A missing key is not papered over with a dummy bearer token: keyless
+  // servers get no Authorization header at all.
+  const client =
+    clientOverride ??
+    (new OpenAI({
+      apiKey: config.apiKey ?? 'unused',
+      baseURL: config.baseUrl.replace(/\/+$/, ''),
+      timeout: timeoutMs,
+      maxRetries: config.maxRetries ?? OPENAI_COMPATIBLE_DEFAULT_MAX_RETRIES,
+      ...(config.apiKey ? {} : { defaultHeaders: { Authorization: null } }),
+      ...(config.fetchImpl
+        ? { fetch: config.fetchImpl as unknown as typeof fetch }
+        : {})
+    }) as OpenAIEmbeddingClient);
 
-  async function embedBatchPage(texts: string[]): Promise<number[][]> {
-    try {
-      const response = await client.embeddings.create({
+  async function embedPage(texts: string[]): Promise<number[][]> {
+    const response = await client.embeddings.create(
+      {
         model: config.model,
-        input: texts.map((t) => t.toWellFormed()),
+        input: texts,
         encoding_format: 'float'
-      });
-      const ordered = response.data
-        .slice()
-        .sort((left, right) => left.index - right.index)
-        .map((item) => item.embedding);
+      },
+      { signal: embeddingDeadline(timeoutMs) }
+    );
+    const ordered = response.data
+      .slice()
+      .sort((left, right) => left.index - right.index)
+      .map((item) => item.embedding);
 
-      if (ordered.length !== texts.length) {
-        throw embeddingError('Embedding API returned an unexpected number of vectors', {
-          provider: 'openai-compatible',
-          model: config.model,
-          expected: texts.length,
-          actual: ordered.length
-        });
-      }
-      for (const vector of ordered) {
-        assertVectorShape(vector, config.dimensions, 'openai-compatible', config.model);
-      }
-      return ordered;
-    } catch (error) {
-      if (error instanceof AppError) throw error;
-      const message =
-        error instanceof Error ? error.message : 'OpenAI-compatible embedding call failed';
-      throw embeddingError(message, {
+    if (ordered.length !== texts.length) {
+      throw embeddingError('Embedding API returned an unexpected number of vectors', {
         provider: 'openai-compatible',
         model: config.model,
-        baseUrl: config.baseUrl
+        expected: texts.length,
+        actual: ordered.length
       });
     }
+    for (const vector of ordered) {
+      assertVectorShape(vector, config.dimensions, 'openai-compatible', config.model);
+    }
+    return ordered;
   }
 
   async function embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) {
       return [];
     }
-    // Split into pages to respect per-request input limits.
-    const results: number[][] = [];
-    for (let i = 0; i < texts.length; i += OPENAI_COMPATIBLE_MAX_BATCH_SIZE) {
-      const page = texts.slice(i, i + OPENAI_COMPATIBLE_MAX_BATCH_SIZE);
-      const pageVectors = await embedBatchPage(page);
-      results.push(...pageVectors);
+    try {
+      const vectors: number[][] = [];
+      for (
+        let offset = 0;
+        offset < texts.length;
+        offset += OPENAI_COMPATIBLE_MAX_BATCH_INPUTS
+      ) {
+        vectors.push(
+          ...(await embedPage(
+            texts.slice(offset, offset + OPENAI_COMPATIBLE_MAX_BATCH_INPUTS)
+          ))
+        );
+      }
+      return vectors;
+    } catch (error) {
+      if (error instanceof AppError || error instanceof RateLimitError) throw error;
+      if (isAbortError(error)) {
+        throw embeddingError(
+          `OpenAI-compatible embedding call timed out after ${timeoutMs}ms`,
+          { provider: 'openai-compatible', model: config.model, timeoutMs }
+        );
+      }
+      const message =
+        error instanceof Error ? error.message : 'OpenAI-compatible embedding call failed';
+      if (isRateLimitError(error)) {
+        throw new RateLimitError(message, { cause: error });
+      }
+      throw embeddingError(message, {
+        provider: 'openai-compatible',
+        model: config.model,
+        baseUrl: config.baseUrl
+      });
     }
-    return results;
   }
 
   async function embed(text: string): Promise<number[]> {

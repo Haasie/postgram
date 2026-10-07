@@ -112,6 +112,33 @@ describe('config', () => {
     expect(cfg.OPENAI_API_KEY).toBeUndefined();
   });
 
+  it('allows OpenAI-compatible embeddings without env base URL so DB-backed settings can supersede', () => {
+    const cfg = loadConfig(
+      baseEnv({
+        EMBEDDING_PROVIDER: 'openai-compatible',
+        OPENAI_API_KEY: 'sk-x'
+      })
+    );
+
+    expect(cfg.EMBEDDING_PROVIDER).toBe('openai-compatible');
+    expect(cfg.EMBEDDING_BASE_URL).toBeUndefined();
+  });
+
+  it('defaults and validates the rate limit backoff', () => {
+    expect(loadConfig(baseEnv()).EXTRACTION_RATE_LIMIT_BACKOFF_MS).toBe(60_000);
+    expect(
+      loadConfig(baseEnv({ EXTRACTION_RATE_LIMIT_BACKOFF_MS: '' }))
+        .EXTRACTION_RATE_LIMIT_BACKOFF_MS
+    ).toBe(60_000);
+    expect(
+      loadConfig(baseEnv({ EXTRACTION_RATE_LIMIT_BACKOFF_MS: '0' }))
+        .EXTRACTION_RATE_LIMIT_BACKOFF_MS
+    ).toBe(0);
+    expect(() =>
+      loadConfig(baseEnv({ EXTRACTION_RATE_LIMIT_BACKOFF_MS: '-1' }))
+    ).toThrow();
+  });
+
   it('allows OpenAI-compatible extraction without env base URL so DB-backed settings can supersede', () => {
     const cfg = loadConfig(
       baseEnv({

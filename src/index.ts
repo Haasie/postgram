@@ -161,7 +161,8 @@ export function buildEmbeddingProviderConfig(
       model,
       dimensions,
       baseUrl,
-      apiKey: config.EMBEDDING_API_KEY
+      apiKey: config.EMBEDDING_API_KEY,
+      timeoutMs: config.EMBEDDING_TIMEOUT_MS
     };
   }
 
@@ -205,9 +206,9 @@ export function createAppliedProviderPolicyFetch(input: {
 }
 
 function describeHost(providerConfig: EmbeddingProviderConfig): string {
-  if (providerConfig.provider === 'ollama') return providerConfig.baseUrl;
-  if (providerConfig.provider === 'openai-compatible') return providerConfig.baseUrl;
-  return 'api.openai.com';
+  return providerConfig.provider === 'openai'
+    ? 'api.openai.com'
+    : providerConfig.baseUrl;
 }
 
 function printFirstRunBootstrapToken(input: {
@@ -386,13 +387,16 @@ export async function startServer(): Promise<{
   );
 
   let providerConfig = buildEmbeddingProviderConfig(runtimeConfig);
-  if (providerConfig.provider === 'ollama') {
+  if (
+    providerConfig.provider === 'ollama'
+    || providerConfig.provider === 'openai-compatible'
+  ) {
     const settingKey = runtimeConfig.EMBEDDING_BASE_URL
       ? 'EMBEDDING_BASE_URL'
       : 'OLLAMA_BASE_URL';
     const fetchImpl = createAppliedProviderPolicyFetch({
       settingKey,
-      provider: 'ollama',
+      provider: providerConfig.provider,
       baseUrl: providerConfig.baseUrl,
       appliedSettingKeys: appliedProviderSettingKeys
     });
@@ -534,17 +538,10 @@ export async function startServer(): Promise<{
     }
   });
   let workerActive = true;
-  // How long the worker pauses when a rate-limit (429) is returned by the LLM
-  // API. Overridable via env for operators who want a different backoff.
-  const rateLimitBackoffMs = (() => {
-    const raw = process.env.EXTRACTION_RATE_LIMIT_BACKOFF_MS;
-    const parsed = raw ? Number(raw) : Number.NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000;
-  })();
-
   // Prune the query embedding cache on a slow timer rather than per request:
   // the read path must stay a single indexed SELECT with no write behind it.
   let nextCachePruneAt = 0;
+  const rateLimitBackoffMs = runtimeConfig.EXTRACTION_RATE_LIMIT_BACKOFF_MS;
   const workerLoop = async () => {
     while (workerActive) {
       try {
@@ -552,7 +549,7 @@ export async function startServer(): Promise<{
         if (rateLimited) {
           logger.warn(
             { backoffMs: rateLimitBackoffMs },
-            'LLM rate limit hit — pausing extraction worker'
+            'upstream rate limit (HTTP 429) hit — pausing enrichment worker'
           );
           await new Promise<void>((resolve) => {
             setTimeout(resolve, rateLimitBackoffMs);

@@ -1,3 +1,5 @@
+import { RateLimitError } from '../util/errors.js';
+
 /**
  * Optional JSON schema forwarded to providers that support structured
  * outputs. Callers that want to constrain the model's response shape pass the
@@ -138,7 +140,8 @@ function createOpenAiProvider(
       // like "Unknown parameter: 'reasoning_effort'" behind a generic 400.
       const errorBody = await response.text().catch(() => '');
       const detail = errorBody ? ` - ${errorBody}` : '';
-      throw new Error(`${errorLabel} API error: ${response.status}${detail}`);
+      const message = `${errorLabel} API error: ${response.status}${detail}`;
+      throw response.status === 429 ? new RateLimitError(message) : new Error(message);
     }
 
     const body = (await response.json()) as OpenAiResponse;
@@ -170,7 +173,8 @@ function createAnthropicProvider(apiKey: string, model: string): LlmProvider {
     );
 
     if (!response.ok) {
-      throw new Error(`Anthropic API error: ${response.status}`);
+      const message = `Anthropic API error: ${response.status}`;
+      throw response.status === 429 ? new RateLimitError(message) : new Error(message);
     }
 
     const body = (await response.json()) as AnthropicResponse;
@@ -241,7 +245,8 @@ function createOllamaProvider(
     );
 
     if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.status}`);
+      const message = `Ollama API error: ${response.status}`;
+      throw response.status === 429 ? new RateLimitError(message) : new Error(message);
     }
 
     const body = (await response.json()) as OllamaResponse;

@@ -39,7 +39,7 @@ export function chunkText(
   text: string,
   options: ChunkTextOptions = {}
 ): ChunkDraft[] {
-  const normalized = (text ?? '').toWellFormed().trim();
+  const normalized = text.trim();
   if (!normalized) {
     return [];
   }
@@ -58,7 +58,7 @@ export function chunkText(
       rawEnd === normalized.length
         ? rawEnd
         : findSplitPoint(normalized, start, rawEnd, separators);
-    const content = normalized.slice(start, end).trim().toWellFormed();
+    const content = normalized.slice(start, end).trim();
 
     if (content) {
       chunks.push({

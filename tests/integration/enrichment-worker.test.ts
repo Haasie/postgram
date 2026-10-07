@@ -4,7 +4,7 @@ import { createEnrichmentWorker } from '../../src/services/enrichment-worker.js'
 import { createEmbeddingService } from '../../src/services/embedding-service.js';
 import { recallEntity, storeEntity } from '../../src/services/entity-service.js';
 import type { AuthContext } from '../../src/auth/types.js';
-import { AppError, ErrorCode } from '../../src/util/errors.js';
+import { AppError, ErrorCode, RateLimitError } from '../../src/util/errors.js';
 import {
   createTestDatabase,
   resetTestDatabase,
@@ -597,7 +597,7 @@ describe('enrichment-worker', () => {
       extractionEnabled: true,
       callLlm: () =>
         Promise.reject(
-          new Error(
+          new RateLimitError(
             'OpenAI-compatible API error: 429 - {"object":"error","message":"Rate limit exceeded","type":"rate_limited"}'
           )
         )
@@ -609,6 +609,193 @@ describe('enrichment-worker', () => {
     expect(result.rateLimited).toBe(true);
 
     // Entity must still be 'pending' — not 'failed' — so it is retried.
+    const row = await database.pool.query<{
+      extraction_status: string | null;
+      extraction_error: string | null;
+    }>(
+      'SELECT extraction_status, extraction_error FROM entities WHERE id = $1',
+      [stored.id]
+    );
+    expect(row.rows[0]?.extraction_status).toBe('pending');
+    expect(row.rows[0]?.extraction_error).toBeNull();
+  }, 120_000);
+
+  it('does not treat a non-429 extraction error as throttling, even when the text contains 429', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const stored = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'entity whose extraction fails permanently'
+    }))._unsafeUnwrap();
+    await database.pool.query(
+      `UPDATE entities
+       SET enrichment_status = 'completed', extraction_status = 'pending'
+       WHERE id = $1`,
+      [stored.id]
+    );
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService(),
+      extractionEnabled: true,
+      callLlm: () => Promise.reject(new Error('LLM request timed out after 4290ms'))
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(false);
+    const row = await database.pool.query<{
+      extraction_status: string | null;
+      extraction_error: string | null;
+    }>(
+      'SELECT extraction_status, extraction_error FROM entities WHERE id = $1',
+      [stored.id]
+    );
+    expect(row.rows[0]?.extraction_status).toBe('failed');
+    expect(row.rows[0]?.extraction_error).toContain('4290ms');
+  }, 120_000);
+
+  it('keeps serving healthy entities behind a rate-limited one (no head-of-line blocking)', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const first = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'oldest entity, upstream throttles it'
+    }))._unsafeUnwrap();
+    const second = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'newer entity, extraction works fine'
+    }))._unsafeUnwrap();
+    await database.pool.query(
+      `UPDATE entities
+       SET enrichment_status = 'completed', extraction_status = 'pending'
+       WHERE id = ANY($1::uuid[])`,
+      [[first.id, second.id]]
+    );
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService(),
+      extractionEnabled: true,
+      extractionMinContentChars: 0,
+      callLlm: (prompt) =>
+        prompt.includes('oldest entity')
+          ? Promise.reject(new RateLimitError('429'))
+          : Promise.resolve('[]')
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(true);
+    const rows = await database.pool.query<{ id: string; extraction_status: string | null }>(
+      'SELECT id, extraction_status FROM entities WHERE id = ANY($1::uuid[])',
+      [[first.id, second.id]]
+    );
+    const status = new Map(rows.rows.map((r) => [r.id, r.extraction_status]));
+    expect(status.get(first.id)).toBe('pending');
+    expect(status.get(second.id)).toBe('completed');
+  }, 120_000);
+
+  it('treats an embedding-phase 429 as transient: entity stays pending, attempts unchanged', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const stored = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'entity whose embedding call is throttled'
+    }))._unsafeUnwrap();
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService({
+        embedBatch: () => Promise.reject(new RateLimitError('429'))
+      })
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(true);
+    const row = await database.pool.query<{
+      enrichment_status: string;
+      enrichment_attempts: number;
+    }>(
+      'SELECT enrichment_status, enrichment_attempts FROM entities WHERE id = $1',
+      [stored.id]
+    );
+    expect(row.rows[0]?.enrichment_status).toBe('pending');
+    expect(row.rows[0]?.enrichment_attempts).toBe(0);
+  }, 120_000);
+
+  it('counts a non-429 embedding failure whose text contains 429 as a real attempt', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const stored = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'entity whose embedding call breaks'
+    }))._unsafeUnwrap();
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService({
+        embedBatch: () =>
+          Promise.reject(
+            new AppError(ErrorCode.EMBEDDING_FAILED, 'expected 1, actual 1429')
+          )
+      })
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(false);
+    const row = await database.pool.query<{ enrichment_attempts: number }>(
+      'SELECT enrichment_attempts FROM entities WHERE id = $1',
+      [stored.id]
+    );
+    expect(row.rows[0]?.enrichment_attempts).toBe(1);
+  }, 120_000);
+
+  it('propagates a 429 from the semantic target match so the entity stays pending', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const stored = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'Meeting notes mentioning Alice and Bob in a long enough text body'
+    }))._unsafeUnwrap();
+    await database.pool.query(
+      `UPDATE entities
+       SET enrichment_status = 'completed', extraction_status = 'pending'
+       WHERE id = $1`,
+      [stored.id]
+    );
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService({
+        embedBatch: () => Promise.reject(new RateLimitError('429'))
+      }),
+      extractionEnabled: true,
+      extractionMinContentChars: 0,
+      callLlm: () =>
+        Promise.resolve(
+          JSON.stringify([
+            { target_name: 'Alice', target_type: 'person', relation: 'related_to', confidence: 0.9 },
+            { target_name: 'Bob', target_type: 'person', relation: 'related_to', confidence: 0.9 }
+          ])
+        )
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(true);
     const row = await database.pool.query<{
       extraction_status: string | null;
       extraction_error: string | null;

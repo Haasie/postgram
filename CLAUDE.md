@@ -3,6 +3,7 @@
 Auto-generated from all feature plans. Last updated: 2026-04-18
 
 ## Active Technologies
+
 - TypeScript 5.9 on Node.js 22+ (LTS) + Hono (HTTP), `@modelcontextprotocol/sdk` (MCP SSE), (002-local-embeddings)
 - PostgreSQL 16+ with `pgvector` and `pgcrypto`; raw SQL with typed (002-local-embeddings)
 
@@ -14,21 +15,49 @@ TypeScript on Node.js 22+ (LTS): Follow standard conventions
 
 ## Developement workflow
 
-Red/Green TDD with SDD specifications. 
-
-IMPORTANT: before pushing code, use /codex (skill-codex) to have your changes reviewed by Codex, fix all p0, p1 and p2 issues at before pushing, after fixing, ask for a review again, until no p0, p1 or p2 issues remain. After pushing, create a PR.
+Red/Green TDD with SDD specifications.
 
 Whenever a runtime configuration value is added or renamed, update the Docker
 setup in the same change. Check `docker-compose.yml`, `.env.example`, Dockerfile
 defaults, deployment docs, and README tables so container deployments receive
 the new value.
 
+## Fork context (Haasie/postgram)
+
+This repository is a **personal fork** of the open-source project
+[`ivo-toby/postgram`](https://github.com/ivo-toby/postgram). Two things live
+here and must not be mixed up:
+
+1. **Fork `main` = the running deployment** (Cosmos Cloud, Mistral for
+   embeddings and extraction). It carries fork-only files and code that must
+   never go upstream: `cosmos-compose.json`, `COSMOS_SETUP.md`, `build-ui.sh`,
+   `update.sh`/`update.log`, `postgram-groom.*`, the local
+   `docker-compose.yml` and `ui/nginx.conf`, and code marked `FORK-ONLY`
+   (e.g. the Obsidian vault path excludes in `enrichment-worker.ts`).
+2. **Upstream contributions** = branches cut from `upstream/main`
+   (`git remote add upstream https://github.com/ivo-toby/postgram`), one
+   concern per branch, PR against `ivo-toby/postgram`. Never branch a
+   contribution from fork `main`; it drags deploy files into the PR.
+
+Every fix that is contributed upstream must **also** be merged into fork
+`main` and pushed, so the deployment runs it before upstream merges it. When
+merging a contribution branch into fork `main`, keep the fork's deploy files
+(`--ours`) and `FORK-ONLY` code, and take the contribution's version of the
+shared code.
+
+Sessions are scoped to `Haasie/postgram`; `ivo-toby/postgram` cannot be
+attached in the same session (same repo name). Opening the upstream PR is done
+by Joeri via the compare URL
+`https://github.com/ivo-toby/postgram/compare/main...Haasie:postgram:<branch>`.
+
 ## Recent Changes
+
 - 002-local-embeddings: Added TypeScript 5.9 on Node.js 22+ (LTS) + Hono (HTTP), `@modelcontextprotocol/sdk` (MCP SSE),
 
 - 001-phase1-mvp: Added TypeScript on Node.js 22+ (LTS) + Hono (HTTP), @modelcontextprotocol/sdk (MCP SSE),
 
 <!-- MANUAL ADDITIONS START -->
+
 ## E2E Smoke Testing with Sprite
 
 Use the sprite CLI to spin up a real environment and validate wiring end-to-end.
@@ -78,6 +107,7 @@ sprite destroy postgram-test --force
 ```
 
 Key points:
+
 - Sprite VMs use `fdf::/16` for localhost — pg_hba.conf needs this range added
 - The server auto-runs migrations on startup, no separate migrate step needed
 - Enrichment worker runs in-process; entities move from `pending` to `completed` within ~1s

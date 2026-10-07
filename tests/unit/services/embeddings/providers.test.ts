@@ -4,10 +4,12 @@ import { APIUserAbortError } from 'openai';
 
 import {
   createEmbeddingProvider,
+  createOpenAICompatibleEmbeddingProvider,
   createOpenAIEmbeddingProvider,
+  OPENAI_COMPATIBLE_MAX_BATCH_INPUTS,
   resolveEmbeddingDefaults
 } from '../../../../src/services/embeddings/providers.js';
-import { AppError, ErrorCode } from '../../../../src/util/errors.js';
+import { AppError, ErrorCode, RateLimitError } from '../../../../src/util/errors.js';
 
 describe('resolveEmbeddingDefaults', () => {
   it('returns OpenAI defaults when unset', () => {
@@ -356,5 +358,86 @@ describe('createEmbeddingProvider factory', () => {
     expect(provider.name).toBe('ollama');
     expect(provider.model).toBe('bge-m3');
     expect(provider.dimensions).toBe(1024);
+  });
+});
+
+describe('OpenAI-compatible embedding provider', () => {
+  const config = {
+    provider: 'openai-compatible' as const,
+    model: 'mistral-embed-2312',
+    dimensions: 2,
+    baseUrl: 'https://api.mistral.ai/v1'
+  };
+
+  it('resolves Mistral defaults', () => {
+    expect(resolveEmbeddingDefaults('openai-compatible')).toEqual({
+      model: 'mistral-embed-2312',
+      dimensions: 1024
+    });
+  });
+
+  it('pages large batches and passes an abort signal on every page', async () => {
+    const create = vi.fn(
+      (params: { input: string[] }, options?: { signal?: AbortSignal | undefined }) =>
+        Promise.resolve({
+          data: params.input.map((_, index) => ({
+            index,
+            embedding: options ? [0.1, 0.2] : [0, 0]
+          }))
+        })
+    );
+    const provider = createOpenAICompatibleEmbeddingProvider(config, {
+      embeddings: { create }
+    });
+
+    const total = OPENAI_COMPATIBLE_MAX_BATCH_INPUTS * 2 + 1;
+    const vectors = await provider.embedBatch(
+      Array.from({ length: total }, (_, i) => `t${i}`)
+    );
+
+    expect(vectors).toHaveLength(total);
+    expect(create).toHaveBeenCalledTimes(3);
+    const sizes = create.mock.calls.map(
+      ([params]) => (params as { input: string[] }).input.length
+    );
+    expect(sizes).toEqual([
+      OPENAI_COMPATIBLE_MAX_BATCH_INPUTS,
+      OPENAI_COMPATIBLE_MAX_BATCH_INPUTS,
+      1
+    ]);
+    for (const call of create.mock.calls) {
+      expect((call[1] as { signal?: AbortSignal }).signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('maps an HTTP 429 to RateLimitError', async () => {
+    const create = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('429 Rate limit exceeded'), { status: 429 }));
+    const provider = createOpenAICompatibleEmbeddingProvider(config, {
+      embeddings: { create }
+    });
+
+    await expect(provider.embedBatch(['a'])).rejects.toBeInstanceOf(RateLimitError);
+  });
+
+  it('keeps non-429 failures as EMBEDDING_FAILED even if the text mentions 429', async () => {
+    const create = vi.fn().mockRejectedValue(new Error('upstream said 1429'));
+    const provider = createOpenAICompatibleEmbeddingProvider(config, {
+      embeddings: { create }
+    });
+
+    const error = await provider.embedBatch(['a']).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AppError);
+    expect((error as AppError).code).toBe(ErrorCode.EMBEDDING_FAILED);
+  });
+
+  it('rejects a short response per page', async () => {
+    const create = vi.fn().mockResolvedValue({ data: [{ index: 0, embedding: [0.1, 0.2] }] });
+    const provider = createOpenAICompatibleEmbeddingProvider(config, {
+      embeddings: { create }
+    });
+
+    await expect(provider.embedBatch(['a', 'b'])).rejects.toBeInstanceOf(AppError);
   });
 });
