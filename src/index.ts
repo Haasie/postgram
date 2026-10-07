@@ -26,6 +26,7 @@ import {
 } from './services/embeddings/providers.js';
 import { ensureEmbeddingIdentityAgreement } from './services/embeddings/admin.js';
 import { createEnrichmentWorker } from './services/enrichment-worker.js';
+import { rateLimitBackoffMs } from './services/rate-limit-backoff.js';
 import {
   createProviderPolicyFetch,
   readAppliedProviderSettingKeys,
@@ -43,6 +44,7 @@ import { registerAdminRoutes } from './transport/admin.js';
 import { registerOAuthRoutes } from './transport/oauth.js';
 import { registerRestRoutes } from './transport/rest.js';
 import { createLogger } from './util/logger.js';
+import { sleep } from './util/sleep.js';
 import {
   AppError,
   ErrorCode,
@@ -535,27 +537,36 @@ export async function startServer(): Promise<{
       enabled: runtimeConfig.EXTRACTION_SEMANTIC_NEIGHBORS_ENABLED,
       maxNeighbors: runtimeConfig.EXTRACTION_SEMANTIC_NEIGHBORS_MAX,
       minSimilarity: runtimeConfig.EXTRACTION_SEMANTIC_NEIGHBORS_MIN_SIMILARITY
-    }
+    },
+    rateLimitBackoffMs: runtimeConfig.EXTRACTION_RATE_LIMIT_BACKOFF_MS
   });
   let workerActive = true;
   // Prune the query embedding cache on a slow timer rather than per request:
   // the read path must stay a single indexed SELECT with no write behind it.
   let nextCachePruneAt = 0;
-  const rateLimitBackoffMs = runtimeConfig.EXTRACTION_RATE_LIMIT_BACKOFF_MS;
+  // Consecutive passes that hit a 429; drives the exponential pause and
+  // resets on the first pass that is not throttled.
+  let consecutiveRateLimitedPasses = 0;
   const workerLoop = async () => {
     while (workerActive) {
       try {
         const { rateLimited } = await worker.runOnce();
         if (rateLimited) {
+          const backoffMs = rateLimitBackoffMs(
+            runtimeConfig.EXTRACTION_RATE_LIMIT_BACKOFF_MS,
+            consecutiveRateLimitedPasses
+          );
+          consecutiveRateLimitedPasses += 1;
           logger.warn(
-            { backoffMs: rateLimitBackoffMs },
+            { backoffMs, consecutiveRateLimitedPasses },
             'upstream rate limit (HTTP 429) hit — pausing enrichment worker'
           );
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, rateLimitBackoffMs);
-          });
+          // Never below the poll interval: with the backoff set to 0 a
+          // throttled upstream must not turn this loop into a hot spin.
+          await sleep(Math.max(backoffMs, config.ENRICHMENT_POLL_INTERVAL_MS));
           continue;
         }
+        consecutiveRateLimitedPasses = 0;
       } catch (error) {
         logger.error({ err: error }, 'enrichment worker iteration failed');
       }
@@ -575,9 +586,7 @@ export async function startServer(): Promise<{
         }
       }
 
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, config.ENRICHMENT_POLL_INTERVAL_MS);
-      });
+      await sleep(config.ENRICHMENT_POLL_INTERVAL_MS);
     }
   };
   void workerLoop();

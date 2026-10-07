@@ -14,6 +14,10 @@ import {
   SemanticMatchUnavailableError
 } from './extraction-service.js';
 import { getMemoryRole } from './memory-role-service.js';
+import {
+  MAX_CONSECUTIVE_RATE_LIMITS,
+  rateLimitBackoffMs
+} from './rate-limit-backoff.js';
 
 type PendingEntityRow = {
   id: string;
@@ -81,7 +85,24 @@ type EnrichmentWorkerOptions = {
     maxNeighbors?: number;
     minSimilarity?: number;
   };
+  /**
+   * Base of the per-entity cooldown after an upstream 429
+   * (EXTRACTION_RATE_LIMIT_BACKOFF_MS). Defaults to 60s; 0 disables it.
+   */
+  rateLimitBackoffMs?: number;
 };
+
+type RateLimitPhase = 'enrichment' | 'extraction';
+
+// Rows still cooling down after a 429 are invisible to the pickers below.
+const NOT_COOLING_DOWN = (phase: RateLimitPhase) => `
+  NOT EXISTS (
+    SELECT 1
+    FROM entity_rate_limit_deferrals d
+    WHERE d.entity_id = entities.id
+      AND d.phase = '${phase}'
+      AND d.next_attempt_at > now()
+  )`;
 
 async function rollbackQuietly(client: PoolClient): Promise<void> {
   try {
@@ -160,6 +181,59 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
 
   const embeddingService = options.embeddingService ?? createEmbeddingService();
   const logger = options.logger ?? createLogger('info');
+  const rateLimitBaseMs = options.rateLimitBackoffMs ?? 60_000;
+
+  /**
+   * Records a 429 for one entity and phase: bumps the consecutive count and
+   * pushes next_attempt_at out by an exponential, jittered cooldown. Returns
+   * true once the series has reached MAX_CONSECUTIVE_RATE_LIMITS, at which
+   * point the caller converts it into a real failure.
+   */
+  async function recordRateLimit(
+    entityId: string,
+    phase: RateLimitPhase,
+    error: unknown
+  ): Promise<boolean> {
+    const upsert = await options.pool.query<{ consecutive_rate_limits: number }>(
+      `
+        INSERT INTO entity_rate_limit_deferrals AS d (
+          entity_id, phase, consecutive_rate_limits, next_attempt_at, last_error
+        )
+        VALUES ($1, $2, 1, now(), $3)
+        ON CONFLICT (entity_id, phase) DO UPDATE
+        SET consecutive_rate_limits = d.consecutive_rate_limits + 1,
+            last_error = EXCLUDED.last_error
+        RETURNING consecutive_rate_limits
+      `,
+      [entityId, phase, truncateErrorMessage(error)]
+    );
+    const consecutive = upsert.rows[0]?.consecutive_rate_limits ?? 1;
+    if (consecutive >= MAX_CONSECUTIVE_RATE_LIMITS) {
+      await clearRateLimit(entityId, phase);
+      return true;
+    }
+    const cooldownMs = rateLimitBackoffMs(rateLimitBaseMs, consecutive - 1);
+    await options.pool.query(
+      `
+        UPDATE entity_rate_limit_deferrals
+        SET next_attempt_at = now() + ($3::double precision * interval '1 millisecond')
+        WHERE entity_id = $1 AND phase = $2
+      `,
+      [entityId, phase, cooldownMs]
+    );
+    return false;
+  }
+
+  async function clearRateLimit(
+    entityId: string,
+    phase: RateLimitPhase,
+    client: Pick<PoolClient, 'query'> = options.pool
+  ): Promise<void> {
+    await client.query(
+      'DELETE FROM entity_rate_limit_deferrals WHERE entity_id = $1 AND phase = $2',
+      [entityId, phase]
+    );
+  }
 
   async function hasPendingEnrichment(): Promise<boolean> {
     const result = await options.pool.query(
@@ -175,6 +249,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
               AND updated_at < now() - interval '5 minutes'
             )
           )
+          AND ${NOT_COOLING_DOWN('enrichment')}
         LIMIT 1
       `
     );
@@ -204,6 +279,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
                 AND updated_at < now() - interval '5 minutes'
               )
             )
+            AND ${NOT_COOLING_DOWN('enrichment')}
           ORDER BY
             CASE WHEN enrichment_status = 'pending' THEN 0 ELSE 1 END,
             created_at ASC
@@ -301,6 +377,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
         );
       }
 
+      await clearRateLimit(entity.id, 'enrichment', client);
       await client.query('COMMIT');
       return true;
     } catch (error) {
@@ -311,17 +388,42 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
       }
 
       if (isRateLimitError(error)) {
-        // 429 from the embedding API is transient — re-throw so the worker
-        // loop applies back-off. The entity stays 'pending' (the transaction
-        // was rolled back) and will be retried after the pause.
+        // 429 from the embedding API is transient. The transaction was rolled
+        // back, so the entity keeps its status and attempt count; it gets a
+        // cooldown so the next poll moves on to other rows, and the error is
+        // re-thrown so the worker loop pauses.
+        const exhausted = await recordRateLimit(entity.id, 'enrichment', error);
+        if (!exhausted) {
+          logger.warn(
+            { entityId: entity.id },
+            'enrichment deferred — embedding rate limit (429), will back off and retry'
+          );
+          throw error;
+        }
         logger.warn(
-          { entityId: entity.id },
-          'enrichment deferred — embedding rate limit (429), will back off and retry'
+          { entityId: entity.id, consecutiveRateLimits: MAX_CONSECUTIVE_RATE_LIMITS },
+          'enrichment failed — rate limited too many times in a row'
+        );
+        await options.pool.query(
+          `
+            UPDATE entities
+            SET enrichment_status = 'failed',
+                enrichment_attempts = enrichment_attempts + 1,
+                enrichment_error = $2
+            WHERE id = $1
+          `,
+          [
+            entity.id,
+            truncateErrorMessage(
+              `rate limited ${MAX_CONSECUTIVE_RATE_LIMITS} times in a row: ${truncateErrorMessage(error)}`
+            )
+          ]
         );
         throw error;
       }
 
       logger.warn({ err: error, entityId: entity.id }, 'enrichment failed');
+      await clearRateLimit(entity.id, 'enrichment');
 
       await options.pool.query(
         `
@@ -398,6 +500,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
         FROM entities
         WHERE extraction_status = 'pending'
           AND content IS NOT NULL
+          AND ${NOT_COOLING_DOWN('extraction')}
         ORDER BY created_at ASC
         LIMIT 5
       `
@@ -496,6 +599,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
              WHERE id = $1`,
             [entity.id]
           );
+          await clearRateLimit(entity.id, 'extraction');
         } catch (error) {
           if (error instanceof SemanticMatchUnavailableError) {
             // Leave extraction_status = 'pending' AND the override columns
@@ -507,18 +611,35 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
               'extraction deferred — embeddings unavailable, will retry'
             );
           } else if (isRateLimitError(error)) {
-            // Both branches above are explicit types; this one is matched on
-            // HTTP status only (never message text), so a SemanticMatch error
-            // wrapping a 429 still takes the branch above.
+            // Order matters: the branch above matches an explicit type, this
+            // one matches on HTTP status (never message text). A
+            // SemanticMatchUnavailableError is never a 429, so it cannot be
+            // shadowed here, and a 429 is never misread as that error.
             //
-            // 429 is transient: leave the entity pending (no attempt counted,
-            // no extraction_error) and keep going with the rest of the batch.
-            logger.warn(
-              { entityId: entity.id },
-              'extraction deferred — LLM rate limit (429), will back off and retry'
-            );
+            // 429 is transient: leave the entity pending (no extraction_error),
+            // give it a cooldown, and keep going with the rest of the batch.
             rateLimited = true;
             entityRateLimited = true;
+            if (await recordRateLimit(entity.id, 'extraction', error)) {
+              logger.warn(
+                { entityId: entity.id, consecutiveRateLimits: MAX_CONSECUTIVE_RATE_LIMITS },
+                'extraction failed — rate limited too many times in a row'
+              );
+              await options.pool.query(
+                "UPDATE entities SET extraction_status = 'failed', extraction_error = $2 WHERE id = $1",
+                [
+                  entity.id,
+                  truncateErrorMessage(
+                    `rate limited ${MAX_CONSECUTIVE_RATE_LIMITS} times in a row: ${truncateErrorMessage(error)}`
+                  )
+                ]
+              );
+            } else {
+              logger.warn(
+                { entityId: entity.id },
+                'extraction deferred — LLM rate limit (429), will back off and retry'
+              );
+            }
           } else {
             logger.warn(
               { err: error, entityId: entity.id },
@@ -530,6 +651,7 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
               "UPDATE entities SET extraction_status = 'failed', extraction_error = $2 WHERE id = $1",
               [entity.id, truncateErrorMessage(error)]
             );
+            await clearRateLimit(entity.id, 'extraction');
           }
         } finally {
           await lockClient
@@ -586,8 +708,8 @@ export function createEnrichmentWorker(options: EnrichmentWorkerOptions) {
             break;
           }
           if (step.rateLimited) {
-            // The batch was drained; the oldest pending rows would be picked
-            // again immediately, so hand control back for the back-off.
+            // The batch was drained (throttled rows now carry a cooldown);
+            // hand control back so the worker loop pauses before more calls.
             rateLimited = true;
             break;
           }

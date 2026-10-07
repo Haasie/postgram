@@ -64,6 +64,37 @@ const OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS = 1024;
 // Hosted OpenAI-compatible endpoints cap inputs per request; chunking a large
 // note can yield hundreds of chunks, so page them.
 export const OPENAI_COMPATIBLE_MAX_BATCH_INPUTS = 64;
+// ...and the total size of a request. Characters are a conservative proxy for
+// tokens (roughly 4 chars per token), keeping a page near 8k tokens. A single
+// input larger than this is still sent, alone, so nothing is dropped.
+export const OPENAI_COMPATIBLE_MAX_BATCH_CHARS = 32_000;
+
+/** Splits inputs into pages bounded by count and by total characters. */
+export function pageEmbeddingInputs(
+  texts: string[],
+  maxInputs = OPENAI_COMPATIBLE_MAX_BATCH_INPUTS,
+  maxChars = OPENAI_COMPATIBLE_MAX_BATCH_CHARS
+): string[][] {
+  const pages: string[][] = [];
+  let page: string[] = [];
+  let pageChars = 0;
+  for (const text of texts) {
+    if (
+      page.length > 0
+      && (page.length >= maxInputs || pageChars + text.length > maxChars)
+    ) {
+      pages.push(page);
+      page = [];
+      pageChars = 0;
+    }
+    page.push(text);
+    pageChars += text.length;
+  }
+  if (page.length > 0) {
+    pages.push(page);
+  }
+  return pages;
+}
 // A throttled upstream is better served by the worker's back-off than by SDK
 // retries that multiply requests inside the window being waited out.
 export const OPENAI_COMPATIBLE_DEFAULT_MAX_RETRIES = 0;
@@ -447,16 +478,8 @@ export function createOpenAICompatibleEmbeddingProvider(
     }
     try {
       const vectors: number[][] = [];
-      for (
-        let offset = 0;
-        offset < texts.length;
-        offset += OPENAI_COMPATIBLE_MAX_BATCH_INPUTS
-      ) {
-        vectors.push(
-          ...(await embedPage(
-            texts.slice(offset, offset + OPENAI_COMPATIBLE_MAX_BATCH_INPUTS)
-          ))
-        );
+      for (const page of pageEmbeddingInputs(texts)) {
+        vectors.push(...(await embedPage(page)));
       }
       return vectors;
     } catch (error) {

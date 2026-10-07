@@ -4,12 +4,15 @@ import { APIUserAbortError } from 'openai';
 
 import {
   createEmbeddingProvider,
+  createOllamaEmbeddingProvider,
   createOpenAICompatibleEmbeddingProvider,
   createOpenAIEmbeddingProvider,
+  OPENAI_COMPATIBLE_MAX_BATCH_CHARS,
   OPENAI_COMPATIBLE_MAX_BATCH_INPUTS,
+  pageEmbeddingInputs,
   resolveEmbeddingDefaults
 } from '../../../../src/services/embeddings/providers.js';
-import { AppError, ErrorCode, RateLimitError } from '../../../../src/util/errors.js';
+import { AppError, ErrorCode, RateLimitError, isRateLimitError } from '../../../../src/util/errors.js';
 
 describe('resolveEmbeddingDefaults', () => {
   it('returns OpenAI defaults when unset', () => {
@@ -439,5 +442,87 @@ describe('OpenAI-compatible embedding provider', () => {
     });
 
     await expect(provider.embedBatch(['a', 'b'])).rejects.toBeInstanceOf(AppError);
+  });
+
+  it('bounds pages by total characters, sending an oversized input alone', () => {
+    const big = 'x'.repeat(OPENAI_COMPATIBLE_MAX_BATCH_CHARS + 1);
+    const half = 'y'.repeat(OPENAI_COMPATIBLE_MAX_BATCH_CHARS / 2);
+
+    const pages = pageEmbeddingInputs(['a', big, half, half, half]);
+
+    expect(pages.map((page) => page.length)).toEqual([1, 1, 2, 1]);
+    expect(pages.flat()).toEqual(['a', big, half, half, half]);
+    for (const page of pages) {
+      const chars = page.reduce((sum, text) => sum + text.length, 0);
+      expect(page.length === 1 || chars <= OPENAI_COMPATIBLE_MAX_BATCH_CHARS).toBe(true);
+    }
+  });
+
+  function recordingFetch() {
+    const calls: Array<{ url: string; headers: Headers }> = [];
+    const fetchImpl = vi.fn((input: string, init: RequestInit) => {
+      calls.push({ url: String(input), headers: new Headers(init.headers) });
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ data: [{ index: 0, embedding: [0.1, 0.2] }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      );
+    });
+    return { calls, fetchImpl };
+  }
+
+  it('routes requests through the injected policy fetch and sends no bearer token without a key', async () => {
+    const { calls, fetchImpl } = recordingFetch();
+    const provider = createOpenAICompatibleEmbeddingProvider({ ...config, fetchImpl });
+
+    await provider.embed('hello');
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(calls[0]?.url).toBe('https://api.mistral.ai/v1/embeddings');
+    expect(calls[0]?.headers.has('authorization')).toBe(false);
+  });
+
+  it('sends the configured key as a bearer token', async () => {
+    const { calls, fetchImpl } = recordingFetch();
+    const provider = createOpenAICompatibleEmbeddingProvider({
+      ...config,
+      apiKey: 'mistral-key',
+      fetchImpl
+    });
+
+    await provider.embed('hello');
+
+    expect(calls[0]?.headers.get('authorization')).toBe('Bearer mistral-key');
+  });
+
+  it('does not let the SDK retry a 429 by default', async () => {
+    const fetchImpl = vi.fn(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ message: 'rate limited' }), {
+          status: 429,
+          headers: { 'content-type': 'application/json' }
+        })
+      )
+    );
+    const provider = createOpenAICompatibleEmbeddingProvider({ ...config, fetchImpl });
+
+    await expect(provider.embed('hello')).rejects.toBeInstanceOf(RateLimitError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Ollama embedding provider rate limiting', () => {
+  it('reports an HTTP 429 as a rate limit', async () => {
+    const provider = createOllamaEmbeddingProvider({
+      provider: 'ollama',
+      model: 'bge-m3',
+      dimensions: 2,
+      baseUrl: 'http://ollama.local:11434',
+      fetchImpl: () => Promise.resolve(new Response('busy', { status: 429 }))
+    });
+
+    const error = await provider.embed('hello').catch((e: unknown) => e);
+    expect(isRateLimitError(error)).toBe(true);
   });
 });

@@ -851,22 +851,15 @@ program
         );
       }
 
-      const { createLlmProvider } = await import('../../services/llm-provider.js');
+      const { createLlmProvider, extractionLlmConfigFromEnv } = await import(
+        '../../services/llm-provider.js'
+      );
       const { createLogger } = await import('../../util/logger.js');
       ({ validateEdgeBatch } = await import(
         '../../services/edge-validation-service.js'
       ));
 
-      callLlm = createLlmProvider({
-        provider: config.EXTRACTION_PROVIDER,
-        model: config.EXTRACTION_MODEL,
-        openaiApiKey: config.OPENAI_API_KEY,
-        anthropicApiKey: config.ANTHROPIC_API_KEY,
-        ollamaBaseUrl: config.OLLAMA_BASE_URL,
-        ollamaApiKey: config.OLLAMA_API_KEY,
-        disableThinking: config.EXTRACTION_DISABLE_THINKING,
-        reasoningEffort: config.EXTRACTION_REASONING_EFFORT
-      });
+      callLlm = createLlmProvider(extractionLlmConfigFromEnv(config));
       logger = createLogger(config.LOG_LEVEL);
     } catch (error) {
       await handleCliFailure(error, json);
@@ -1606,19 +1599,10 @@ async function createExtractionCallLlm(purpose: string): Promise<CallLlm> {
     );
   }
 
-  const { createLlmProvider } = await import('../../services/llm-provider.js');
-  return createLlmProvider({
-    provider: config.EXTRACTION_PROVIDER,
-    model: config.EXTRACTION_MODEL,
-    openaiApiKey: config.OPENAI_API_KEY,
-    extractionBaseUrl: config.EXTRACTION_BASE_URL,
-    extractionApiKey: config.EXTRACTION_API_KEY,
-    anthropicApiKey: config.ANTHROPIC_API_KEY,
-    ollamaBaseUrl: config.OLLAMA_BASE_URL,
-    ollamaApiKey: config.OLLAMA_API_KEY,
-    disableThinking: config.EXTRACTION_DISABLE_THINKING,
-    reasoningEffort: config.EXTRACTION_REASONING_EFFORT
-  });
+  const { createLlmProvider, extractionLlmConfigFromEnv } = await import(
+    '../../services/llm-provider.js'
+  );
+  return createLlmProvider(extractionLlmConfigFromEnv(config));
 }
 
 const memoryCommand = program

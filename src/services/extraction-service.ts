@@ -510,6 +510,10 @@ export async function findMatchingEntityByName(
   // could permanently drop edges for otherwise valid entities. The caller
   // disables auto-create on `semantic_skipped` to avoid creating duplicate
   // stubs for entities the semantic search would have matched.
+  //
+  // The one exception is an upstream 429: that is rethrown, so the worker
+  // keeps the entity pending with a cooldown and pauses, instead of firing
+  // the remaining targets at a throttled API and deferring them all.
   let activeModel: ActiveEmbeddingModel;
   try {
     activeModel = await params.getActiveModel();

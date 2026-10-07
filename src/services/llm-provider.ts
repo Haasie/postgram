@@ -269,7 +269,7 @@ const DEFAULT_MODELS: Record<ExtractionProvider, string> = {
   'openai-compatible': 'gpt-4o-mini'
 };
 
-type ProviderConfig = {
+export type ProviderConfig = {
   provider: ExtractionProvider;
   model?: string | undefined;
   openaiApiKey?: string | undefined;
@@ -293,6 +293,38 @@ type ProviderConfig = {
    */
   reasoningEffort?: ReasoningEffort | undefined;
 };
+
+/**
+ * The extraction LLM settings as read from env config. Every CLI path that
+ * builds an extraction provider goes through this, so a provider-specific
+ * field (such as EXTRACTION_BASE_URL for openai-compatible) cannot be
+ * forgotten at one call site while the server path passes it.
+ */
+export function extractionLlmConfigFromEnv(config: {
+  EXTRACTION_PROVIDER: ExtractionProvider;
+  EXTRACTION_MODEL?: string | undefined;
+  OPENAI_API_KEY?: string | undefined;
+  EXTRACTION_BASE_URL?: string | undefined;
+  EXTRACTION_API_KEY?: string | undefined;
+  ANTHROPIC_API_KEY?: string | undefined;
+  OLLAMA_BASE_URL?: string | undefined;
+  OLLAMA_API_KEY?: string | undefined;
+  EXTRACTION_DISABLE_THINKING?: boolean | undefined;
+  EXTRACTION_REASONING_EFFORT?: ProviderConfig['reasoningEffort'];
+}): ProviderConfig {
+  return {
+    provider: config.EXTRACTION_PROVIDER,
+    model: config.EXTRACTION_MODEL,
+    openaiApiKey: config.OPENAI_API_KEY,
+    extractionBaseUrl: config.EXTRACTION_BASE_URL,
+    extractionApiKey: config.EXTRACTION_API_KEY,
+    anthropicApiKey: config.ANTHROPIC_API_KEY,
+    ollamaBaseUrl: config.OLLAMA_BASE_URL,
+    ollamaApiKey: config.OLLAMA_API_KEY,
+    disableThinking: config.EXTRACTION_DISABLE_THINKING,
+    reasoningEffort: config.EXTRACTION_REASONING_EFFORT
+  };
+}
 
 export function createLlmProvider(config: ProviderConfig): LlmProvider {
   const model = config.model ?? DEFAULT_MODELS[config.provider];
