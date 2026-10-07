@@ -6,6 +6,7 @@ import type {
   EmbeddingService
 } from './embedding-service.js';
 import { vectorToSql } from './embedding-service.js';
+import { isRateLimitError } from '../util/errors.js';
 
 type ExtractionResult = {
   targetName: string;
@@ -372,6 +373,8 @@ export type ExtractionSource = {
 
 type FindMatchParams = {
   targetName: string;
+  /** Pre-computed embedding of `targetName`; skips the per-target embed call. */
+  targetVector?: number[] | undefined;
   /**
    * null means the LLM did not supply a valid target_type. In that case the
    * type-based filters are relaxed so we can still link targets produced by
@@ -514,11 +517,19 @@ export async function findMatchingEntityByName(
     return { id: null, reason: 'semantic_skipped' };
   }
 
-  let vector: number[] | undefined;
-  try {
-    [vector] = await embeddingService.embedBatch([params.targetName], activeModel);
-  } catch {
-    return { id: null, reason: 'semantic_skipped' };
+  let vector: number[] | undefined = params.targetVector;
+  if (!vector) {
+    try {
+      [vector] = await embeddingService.embedBatch([params.targetName], activeModel);
+    } catch (error) {
+      // A 429 is not an outage to degrade around: surface it so the worker
+      // leaves the entity pending and backs off, rather than burning through
+      // every remaining target against a throttled API.
+      if (isRateLimitError(error)) {
+        throw error;
+      }
+      return { id: null, reason: 'semantic_skipped' };
+    }
   }
   if (!vector) return { id: null, reason: 'semantic_skipped' };
 
@@ -700,6 +711,32 @@ export async function extractAndLinkRelationships(
 
   let deferredCount = 0;
 
+  // Embed all distinct target names in one request instead of one request per
+  // target: fewer calls against a rate-limited API. Failures other than 429
+  // fall back to the per-target path (and its semantic_skipped handling).
+  const targetVectors = new Map<string, number[]>();
+  const candidateTargets = Array.from(
+    new Set(extractions.map((e) => e.targetName).filter(Boolean))
+  );
+  if (candidateTargets.length > 1) {
+    try {
+      const vectors = await embeddingService.embedBatch(
+        candidateTargets,
+        await getActiveModel()
+      );
+      candidateTargets.forEach((name, i) => {
+        const vector = vectors[i];
+        if (vector) {
+          targetVectors.set(name, vector);
+        }
+      });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        throw error;
+      }
+    }
+  }
+
   for (const extraction of extractions) {
     const baseLog = {
       entityId: source.id,
@@ -724,6 +761,7 @@ export async function extractAndLinkRelationships(
     const matchResult = await findMatchingEntityByName(pool, embeddingService, {
       targetName: extraction.targetName,
       targetType: extraction.targetType,
+      targetVector: targetVectors.get(extraction.targetName),
       sourceId: source.id,
       minSimilarity,
       getActiveModel

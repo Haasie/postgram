@@ -760,4 +760,50 @@ describe('enrichment-worker', () => {
     );
     expect(row.rows[0]?.enrichment_attempts).toBe(1);
   }, 120_000);
+
+  it('propagates a 429 from the semantic target match so the entity stays pending', async () => {
+    if (!database) {
+      throw new Error('test database not initialized');
+    }
+
+    const stored = (await storeEntity(database.pool, makeAuthContext(), {
+      type: 'document',
+      content: 'Meeting notes mentioning Alice and Bob in a long enough text body'
+    }))._unsafeUnwrap();
+    await database.pool.query(
+      `UPDATE entities
+       SET enrichment_status = 'completed', extraction_status = 'pending'
+       WHERE id = $1`,
+      [stored.id]
+    );
+
+    const worker = createEnrichmentWorker({
+      pool: database.pool,
+      embeddingService: createEmbeddingService({
+        embedBatch: () => Promise.reject(new RateLimitError('429'))
+      }),
+      extractionEnabled: true,
+      extractionMinContentChars: 0,
+      callLlm: () =>
+        Promise.resolve(
+          JSON.stringify([
+            { target_name: 'Alice', target_type: 'person', relation: 'related_to', confidence: 0.9 },
+            { target_name: 'Bob', target_type: 'person', relation: 'related_to', confidence: 0.9 }
+          ])
+        )
+    });
+
+    const result = await worker.runOnce();
+
+    expect(result.rateLimited).toBe(true);
+    const row = await database.pool.query<{
+      extraction_status: string | null;
+      extraction_error: string | null;
+    }>(
+      'SELECT extraction_status, extraction_error FROM entities WHERE id = $1',
+      [stored.id]
+    );
+    expect(row.rows[0]?.extraction_status).toBe('pending');
+    expect(row.rows[0]?.extraction_error).toBeNull();
+  }, 120_000);
 });
