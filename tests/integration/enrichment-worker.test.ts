@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createEnrichmentWorker } from '../../src/services/enrichment-worker.js';
+import { MAX_CONSECUTIVE_RATE_LIMITS } from '../../src/services/rate-limit-backoff.js';
 import { createEmbeddingService } from '../../src/services/embedding-service.js';
 import { recallEntity, storeEntity } from '../../src/services/entity-service.js';
 import type { AuthContext } from '../../src/auth/types.js';
@@ -806,4 +807,173 @@ describe('enrichment-worker', () => {
     expect(row.rows[0]?.extraction_status).toBe('pending');
     expect(row.rows[0]?.extraction_error).toBeNull();
   }, 120_000);
+
+  describe('per-entity cooldown after a 429', () => {
+    async function deferral(entityId: string, phase: 'enrichment' | 'extraction') {
+      if (!database) throw new Error('test database not initialized');
+      const result = await database.pool.query<{
+        consecutive_rate_limits: number;
+        cooling: boolean;
+      }>(
+        `SELECT consecutive_rate_limits, next_attempt_at > now() AS cooling
+         FROM entity_rate_limit_deferrals WHERE entity_id = $1 AND phase = $2`,
+        [entityId, phase]
+      );
+      return result.rows[0];
+    }
+
+    it('skips a throttled entity on the next poll so the queue behind it keeps moving', async () => {
+      if (!database) throw new Error('test database not initialized');
+
+      const throttled = (await storeEntity(database.pool, makeAuthContext(), {
+        type: 'document',
+        content: 'THROTTLED embedding input'
+      }))._unsafeUnwrap();
+      const healthy = (await storeEntity(database.pool, makeAuthContext(), {
+        type: 'document',
+        content: 'healthy embedding input'
+      }))._unsafeUnwrap();
+
+      const embedded: string[] = [];
+      const worker = createEnrichmentWorker({
+        pool: database.pool,
+        rateLimitBackoffMs: 60_000,
+        embeddingService: createEmbeddingService({
+          embedBatch: (texts) => {
+            if (texts.some((text) => text.includes('THROTTLED'))) {
+              return Promise.reject(new RateLimitError('429'));
+            }
+            embedded.push(...texts);
+            return Promise.resolve(texts.map(() => Array.from({ length: 1536 }, () => 0.01)));
+          }
+        })
+      });
+
+      const first = await worker.runOnce();
+      expect(first.rateLimited).toBe(true);
+      expect(await deferral(throttled.id, 'enrichment')).toEqual({
+        consecutive_rate_limits: 1,
+        cooling: true
+      });
+
+      const second = await worker.runOnce();
+      expect(second.rateLimited).toBe(false);
+
+      const rows = await database.pool.query<{ id: string; enrichment_status: string }>(
+        'SELECT id, enrichment_status FROM entities WHERE id = ANY($1::uuid[])',
+        [[throttled.id, healthy.id]]
+      );
+      const status = new Map(rows.rows.map((r) => [r.id, r.enrichment_status]));
+      expect(status.get(throttled.id)).toBe('pending');
+      expect(status.get(healthy.id)).toBe('completed');
+      expect(embedded.some((text) => text.includes('THROTTLED'))).toBe(false);
+    }, 120_000);
+
+    it('clears the cooldown once the entity succeeds', async () => {
+      if (!database) throw new Error('test database not initialized');
+
+      const stored = (await storeEntity(database.pool, makeAuthContext(), {
+        type: 'document',
+        content: 'recovers after throttling'
+      }))._unsafeUnwrap();
+      await database.pool.query(
+        `INSERT INTO entity_rate_limit_deferrals (entity_id, phase, consecutive_rate_limits, next_attempt_at)
+         VALUES ($1, 'enrichment', 3, now() - interval '1 second')`,
+        [stored.id]
+      );
+
+      const worker = createEnrichmentWorker({
+        pool: database.pool,
+        embeddingService: createEmbeddingService()
+      });
+      await worker.runOnce();
+
+      expect(await deferral(stored.id, 'enrichment')).toBeUndefined();
+      const row = await database.pool.query<{ enrichment_status: string }>(
+        'SELECT enrichment_status FROM entities WHERE id = $1',
+        [stored.id]
+      );
+      expect(row.rows[0]?.enrichment_status).toBe('completed');
+    }, 120_000);
+
+    it('turns an unbroken series of 429s into one counted failure', async () => {
+      if (!database) throw new Error('test database not initialized');
+
+      const stored = (await storeEntity(database.pool, makeAuthContext(), {
+        type: 'document',
+        content: 'permanently throttled'
+      }))._unsafeUnwrap();
+      await database.pool.query(
+        `INSERT INTO entity_rate_limit_deferrals (entity_id, phase, consecutive_rate_limits, next_attempt_at)
+         VALUES ($1, 'enrichment', $2, now() - interval '1 second')`,
+        [stored.id, MAX_CONSECUTIVE_RATE_LIMITS - 1]
+      );
+
+      const worker = createEnrichmentWorker({
+        pool: database.pool,
+        embeddingService: createEmbeddingService({
+          embedBatch: () => Promise.reject(new RateLimitError('429'))
+        })
+      });
+      const result = await worker.runOnce();
+
+      expect(result.rateLimited).toBe(true);
+      const row = await database.pool.query<{
+        enrichment_status: string;
+        enrichment_attempts: number;
+        enrichment_error: string | null;
+      }>(
+        'SELECT enrichment_status, enrichment_attempts, enrichment_error FROM entities WHERE id = $1',
+        [stored.id]
+      );
+      expect(row.rows[0]?.enrichment_status).toBe('failed');
+      expect(row.rows[0]?.enrichment_attempts).toBe(1);
+      expect(row.rows[0]?.enrichment_error).toContain(
+        `rate limited ${MAX_CONSECUTIVE_RATE_LIMITS} times in a row`
+      );
+      expect(await deferral(stored.id, 'enrichment')).toBeUndefined();
+    }, 120_000);
+
+    it('does not call the LLM again for an extraction entity that is cooling down', async () => {
+      if (!database) throw new Error('test database not initialized');
+
+      const stored = (await storeEntity(database.pool, makeAuthContext(), {
+        type: 'document',
+        content: 'extraction gets throttled'
+      }))._unsafeUnwrap();
+      await database.pool.query(
+        `UPDATE entities
+         SET enrichment_status = 'completed', extraction_status = 'pending'
+         WHERE id = $1`,
+        [stored.id]
+      );
+
+      let llmCalls = 0;
+      const worker = createEnrichmentWorker({
+        pool: database.pool,
+        embeddingService: createEmbeddingService(),
+        extractionEnabled: true,
+        extractionMinContentChars: 0,
+        rateLimitBackoffMs: 60_000,
+        callLlm: () => {
+          llmCalls += 1;
+          return Promise.reject(new RateLimitError('429'));
+        }
+      });
+
+      expect((await worker.runOnce()).rateLimited).toBe(true);
+      expect(await deferral(stored.id, 'extraction')).toEqual({
+        consecutive_rate_limits: 1,
+        cooling: true
+      });
+
+      expect((await worker.runOnce()).rateLimited).toBe(false);
+      expect(llmCalls).toBe(1);
+      const row = await database.pool.query<{ extraction_status: string | null }>(
+        'SELECT extraction_status FROM entities WHERE id = $1',
+        [stored.id]
+      );
+      expect(row.rows[0]?.extraction_status).toBe('pending');
+    }, 120_000);
+  });
 });

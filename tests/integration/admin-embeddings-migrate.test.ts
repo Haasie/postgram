@@ -319,6 +319,50 @@ describe('pgm-admin embeddings migrate', () => {
     expect(mismatch?.message).toContain('pgm-admin embeddings migrate');
   }, 60_000);
 
+  it('refuses ollama/bge-m3 -> openai-compatible/mistral-embed at equal dimensions once chunks exist', async () => {
+    if (!database) throw new Error('db not ready');
+
+    // Empty store: bootstrap to bge-m3 (1024 dims).
+    expect(
+      await ensureEmbeddingIdentityAgreement(database.pool, {
+        provider: 'ollama',
+        model: 'bge-m3',
+        dimensions: 1024
+      })
+    ).toBeNull();
+
+    // One bge-m3 chunk exists.
+    await seedApiKey(database.pool, {
+      id: '00000000-0000-0000-0000-000000000103',
+      name: 'worker-key'
+    });
+    const entity = (
+      await storeEntity(database.pool, makeAuth(), { type: 'memory', content: 'bge-m3 vector' })
+    )._unsafeUnwrap();
+    await database.pool.query(
+      `
+        INSERT INTO chunks (entity_id, chunk_index, content, embedding, model_id, token_count)
+        SELECT $1, 0, 'bge-m3 vector', $2::vector, id, 2
+        FROM embedding_models WHERE is_active = true
+      `,
+      [entity.id, `[${new Array(1024).fill(0).join(',')}]`]
+    );
+
+    // Same width, different vector space: must not be accepted silently.
+    const mismatch = await ensureEmbeddingIdentityAgreement(database.pool, {
+      provider: 'openai-compatible',
+      model: 'mistral-embed-2312',
+      dimensions: 1024
+    });
+
+    expect(mismatch).not.toBeNull();
+    expect(mismatch?.message).toContain('pgm-admin embeddings migrate');
+    const active = await database.pool.query<{ provider: string; name: string }>(
+      'SELECT provider, name FROM embedding_models WHERE is_active = true'
+    );
+    expect(active.rows[0]).toEqual({ provider: 'ollama', name: 'bge-m3' });
+  }, 180_000);
+
   it('bootstraps a mismatched empty embedding store to the configured model', async () => {
     if (!database) throw new Error('db not ready');
 

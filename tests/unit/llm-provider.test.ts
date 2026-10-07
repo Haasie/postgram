@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createLlmProvider } from '../../src/services/llm-provider.js';
+import { loadConfig } from '../../src/config.js';
+import {
+  createLlmProvider,
+  extractionLlmConfigFromEnv
+} from '../../src/services/llm-provider.js';
+import { RateLimitError, isRateLimitError } from '../../src/util/errors.js';
 
 describe('createLlmProvider', () => {
   describe('ollama', () => {
@@ -702,5 +707,63 @@ describe('createLlmProvider', () => {
         globalThis.fetch = originalFetch;
       }
     });
+  });
+});
+
+describe('extractionLlmConfigFromEnv', () => {
+  // Regression: pgm-admin built the openai-compatible extraction provider
+  // without EXTRACTION_BASE_URL, so every CLI path that needs the LLM threw
+  // while the server path (which passed it) worked.
+  it('lets the CLI build an openai-compatible extraction provider from env', () => {
+    const config = loadConfig({
+      DATABASE_URL: 'postgres://localhost/postgram',
+      EMBEDDING_PROVIDER: 'ollama',
+      EXTRACTION_ENABLED: 'true',
+      EXTRACTION_PROVIDER: 'openai-compatible',
+      EXTRACTION_BASE_URL: 'https://api.mistral.ai/v1',
+      EXTRACTION_API_KEY: 'mistral-key',
+      EXTRACTION_MODEL: 'mistral-medium-latest'
+    });
+
+    const providerConfig = extractionLlmConfigFromEnv(config);
+
+    expect(providerConfig).toMatchObject({
+      provider: 'openai-compatible',
+      model: 'mistral-medium-latest',
+      extractionBaseUrl: 'https://api.mistral.ai/v1',
+      extractionApiKey: 'mistral-key'
+    });
+    expect(() => createLlmProvider(providerConfig)).not.toThrow();
+  });
+});
+
+describe('HTTP 429 from an extraction provider', () => {
+  const tooManyRequests = () =>
+    vi.fn(() => Promise.resolve(new Response('{"message":"rate limited"}', { status: 429 })));
+
+  it.each([
+    ['openai-compatible', { extractionBaseUrl: 'https://api.mistral.ai/v1', extractionApiKey: 'k' }],
+    ['ollama', { ollamaBaseUrl: 'http://ollama.local:11434' }]
+  ] as const)('%s surfaces it as RateLimitError', async (provider, extra) => {
+    const call = createLlmProvider({
+      provider,
+      model: 'm',
+      ...extra,
+      fetchImpl: tooManyRequests()
+    });
+
+    await expect(call('prompt')).rejects.toBeInstanceOf(RateLimitError);
+  });
+
+  it('keeps other statuses as plain errors', async () => {
+    const call = createLlmProvider({
+      provider: 'openai-compatible',
+      model: 'm',
+      extractionBaseUrl: 'https://api.mistral.ai/v1',
+      fetchImpl: vi.fn(() => Promise.resolve(new Response('bad', { status: 400 })))
+    });
+
+    const error = await call('prompt').catch((e: unknown) => e);
+    expect(isRateLimitError(error)).toBe(false);
   });
 });
