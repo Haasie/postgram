@@ -1,3 +1,9 @@
+## [1.37.2](https://github.com/ivo-toby/postgram/compare/cli-v1.37.1...cli-v1.37.2) (2026-10-08)
+
+### Bug Fixes
+
+* **chunking:** never split surrogate pairs or emit lone surrogates ([#110](https://github.com/ivo-toby/postgram/issues/110)) ([a81d4aa](https://github.com/ivo-toby/postgram/commit/a81d4aaf5dd9d953799820b7d3a928c38144cead))
+
 ## [1.37.1](https://github.com/ivo-toby/postgram/compare/cli-v1.37.0...cli-v1.37.1) (2026-09-03)
 
 ### Bug Fixes
