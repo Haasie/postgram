@@ -98,6 +98,10 @@ services:
 
   postgram-ui:
     image: postgram-postgram-ui:latest
+    environment:
+      # Empty = auto: on Docker's embedded DNS, re-resolve mcp-server every 10s
+      # so recreating it does not break the UI. `off` = resolve once at start.
+      NGINX_RESOLVER: ${NGINX_RESOLVER:-}
     ports:
       - '${UI_BIND_HOST:-0.0.0.0}:${UI_PORT:-3102}:80'
     depends_on:
