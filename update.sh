@@ -29,17 +29,21 @@ fi
 
 if [ "$BEHIND" -gt 0 ] || [ "${1:-}" = "--force" ]; then
     echo "$BEHIND nieuwe commit(s) op origin. Binnenhalen..."
-    # Save our local modifications (like the bugfix and docker-compose.yml configuration)
-    git stash
+    # Save our local modifications (like docker-compose.yml configuration)
+    STASH_OUTPUT=$(git stash 2>&1)
+    echo "$STASH_OUTPUT"
     
     # Pull latest official code
     git pull origin main
     
-    # Restore our modifications
-    if git stash pop; then
-        echo "Successfully reapplied local modifications."
-    else
-        echo "Warning: Stash pop had conflicts. You may need to resolve them manually in the editor."
+    # Restore our modifications only if we stashed something
+    if [ "$STASH_OUTPUT" != "No local changes to save" ]; then
+        if git stash pop; then
+            echo "Successfully reapplied local modifications."
+        else
+            echo "ERROR: Stash pop had conflicts! Resolve them manually before rebuilding." >&2
+            exit 1
+        fi
     fi
     
     echo "Rebuilding UI image..."
