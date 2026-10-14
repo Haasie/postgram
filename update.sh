@@ -53,7 +53,7 @@ if [ "$BEHIND" -gt 0 ] || [ "${1:-}" = "--force" ]; then
     docker build -t postgram-mcp-server:latest .
     
     echo "Restarting containers..."
-    docker compose up -d
+    docker compose up -d --force-recreate
     
     echo "=== Update complete ==="
 else
