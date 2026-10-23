@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+FROM node:22.23.4-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY cli/package.json ./cli/package.json
@@ -7,7 +7,7 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 LABEL io.modelcontextprotocol.server.name="io.github.ivo-toby/postgram"
 WORKDIR /app
 LABEL org.opencontainers.image.source="https://github.com/ivo-toby/postgram" \
