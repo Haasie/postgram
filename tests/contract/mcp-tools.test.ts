@@ -206,6 +206,8 @@ describe('MCP tools', () => {
         [
           'delete',
           'expand',
+          'feature_pr',
+          'feature_stage',
           'groom_session_context',
           'link',
           'queue',
@@ -220,8 +222,30 @@ describe('MCP tools', () => {
           'task_list',
           'task_update',
           'unlink',
-          'update'
+          'update',
+          'where',
+          'workspace_link',
+          'workspace_lookup',
+          'workspace_report'
         ].sort()
+      );
+
+      const searchTool = tools.tools.find((tool) => tool.name === 'search');
+      expect(searchTool?.description).toContain('reciprocal-rank fusion');
+      expect(searchTool?.description).toContain(
+        'below-floor keyword matches require at least half of the retained distinct query terms, rounded up'
+      );
+      expect(searchTool?.description).toContain(
+        'simple lexemes are ANDed so compound identifiers such as ABC-1234 remain intact'
+      );
+      expect(JSON.stringify(searchTool?.inputSchema)).toContain(
+        'Cosine similarity floor'
+      );
+      expect(JSON.stringify(searchTool?.inputSchema)).toContain(
+        'Below-floor keyword matches require at least half of the retained distinct query terms'
+      );
+      expect(JSON.stringify(searchTool?.inputSchema)).toContain(
+        'Full original query text is embedded'
       );
     } finally {
       await close();

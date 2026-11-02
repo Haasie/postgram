@@ -36,8 +36,16 @@ import {
   listTasks,
   updateTask
 } from '../services/task-service.js';
-import type { ServiceResult } from '../types/common.js';
 import type { Entity, Visibility } from '../types/entities.js';
+import {
+  boolishSchema,
+  fullResponseSchema,
+  toToolSuccess,
+  toToolError,
+  toolFromService
+} from './mcp-results.js';
+import type { ToolPayload } from './mcp-results.js';
+import { registerWorkspaceTools } from './mcp-workspace-tools.js';
 import {
   AppError,
   ErrorCode,
@@ -57,8 +65,6 @@ import {
 } from '../util/search-output.js';
 
 type McpApp = Hono<{ Variables: { auth: AuthContext } }>;
-
-type ToolPayload = Record<string, unknown>;
 
 const entityTypeSchema = z.enum([
   'memory',
@@ -89,19 +95,6 @@ const numericSchema = (schema: z.ZodNumber = z.number()) =>
     return Number.isFinite(parsed) ? parsed : value;
   }, schema);
 
-const boolishSchema = () =>
-  z.preprocess((value) => {
-    if (value === 'true') {
-      return true;
-    }
-
-    if (value === 'false') {
-      return false;
-    }
-
-    return value;
-  }, z.boolean());
-
 const stringArraySchema = () =>
   z.preprocess((value) => {
     if (typeof value !== 'string') {
@@ -125,12 +118,6 @@ const statusSchema = z.enum([
   'scheduled',
   'someday'
 ]);
-
-const fullResponseSchema = boolishSchema()
-  .optional()
-  .describe(
-    'If true, return the full legacy JSON response. Defaults to compact output for lower agent token use.'
-  );
 
 const toonSchema = boolishSchema()
   .optional()
@@ -156,18 +143,6 @@ function toStoredEntity(entity: Entity) {
   };
 }
 
-function toToolSuccess(payload: ToolPayload) {
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(payload)
-      }
-    ],
-    structuredContent: payload
-  };
-}
-
 function toToolText(payload: string, structuredContent: ToolPayload) {
   return {
     content: [
@@ -177,21 +152,6 @@ function toToolText(payload: string, structuredContent: ToolPayload) {
       }
     ],
     structuredContent
-  };
-}
-
-function toToolError(error: AppError) {
-  const payload = toErrorResponse(error);
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(payload)
-      }
-    ],
-    structuredContent: payload,
-    isError: true
   };
 }
 
@@ -259,17 +219,6 @@ function filterGroomingCandidatesByVisibility(
   );
 }
 
-async function toolFromService<T, P extends ToolPayload>(
-  result: ServiceResult<T>,
-  map: (value: T) => P,
-  renderSuccess: (payload: P) => ReturnType<typeof toToolSuccess> = toToolSuccess
-) {
-  return result.match(
-    (value) => renderSuccess(map(value)),
-    (error) => toToolError(error)
-  );
-}
-
 function getBearerToken(header: string | undefined): string | null {
   if (!header?.startsWith('Bearer ')) {
     return null;
@@ -296,6 +245,7 @@ function createSessionServer(
     embeddingService?: EmbeddingService | undefined;
     logger?: Pick<Logger, 'debug' | 'warn'> | undefined;
     extractionEnabled?: boolean | undefined;
+    workspaceDormantAfterDays?: number | undefined;
   } = {}
 ) {
   const server = new McpServer({
@@ -521,15 +471,24 @@ function createSessionServer(
     'search',
     {
       description:
-        'Search stored knowledge using hybrid BM25 + vector similarity with recency weighting. Compact results contain matched chunks rather than complete entity content; recall a selected result by id when its full content is needed. Compact results may include edges.count and edges.relations so agents can see traversable graph context without neighbor content. Set expand_graph=true to also return graph-connected entities (requires extraction to have run on the matching documents — use the queue tool to check status). Use expand_graph when exploring relationships, tracing decisions, or understanding what else is connected to a topic; avoid it for direct facts already present in compact results. Set full_response=true only when the complete legacy search envelope, including entity content, is required.',
+        'Search stored knowledge using hybrid vector and keyword retrieval. Candidates are deduplicated by chunk and ranked with reciprocal-rank fusion: 1/(60+vector_rank) + 1/(60+keyword_rank), with a missing branch contributing zero. A candidate ranked first in both branches scores about 0.03279 before recency. The returned score is a relative RRF ordering value, not a probability or percentage; similarity remains the cosine value. Whitespace-separated keyword terms are ORed, while each term\'s simple lexemes are ANDed so compound identifiers such as ABC-1234 remain intact. In multi-term queries, standalone English stopwords are omitted using the English dictionary; matching and ranking use the simple configuration. The full original query text is embedded; keyword retrieval retains the first 24 distinct non-empty parsed terms after that stopword filtering. Equal final-score ties prefer keyword rank, then vector rank. threshold is a cosine similarity floor; below-floor keyword matches require at least half of the retained distinct query terms, rounded up; a single-term query, including a compound identifier, requires its one retained term. Recency weighting uses a true 30-day half-life. Compact results contain matched chunks rather than complete entity content; recall a selected result by id when its full content is needed. Compact results may include edges.count and edges.relations so agents can see traversable graph context without neighbor content. Set expand_graph=true to also return graph-connected entities (requires extraction to have run on the matching documents — use the queue tool to check status). Use expand_graph when exploring relationships, tracing decisions, or understanding what else is connected to a topic; avoid it for direct facts already present in compact results. Set full_response=true only when the complete legacy search envelope, including entity content, is required.',
       inputSchema: {
-        query: z.string().min(1),
+        query: z
+          .string()
+          .min(1)
+          .describe(
+            'Full original query text is embedded; keyword retrieval retains the first 24 distinct non-empty parsed terms after multi-term English stopword filtering.'
+          ),
         type: entityTypeSchema.optional(),
         tags: stringArraySchema().optional(),
         visibility: visibilitySchema.optional(),
         owner: ownerSchema.optional(),
         limit: numericSchema(z.number().int().positive()).optional(),
-        threshold: numericSchema(z.number().min(0).max(1)).optional(),
+        threshold: numericSchema(z.number().min(0).max(1))
+          .optional()
+          .describe(
+            'Cosine similarity floor from 0 to 1. Below-floor keyword matches require at least half of the retained distinct query terms, rounded up; a single-term query, including a compound identifier, requires its one retained term. Keyword terms are ORed across whitespace-separated terms and simple lexemes within a term are conjunctive.'
+          ),
         recency_weight: numericSchema(z.number().min(0)).optional(),
         expand_graph: boolishSchema().optional(),
         include_archived: boolishSchema().optional(),
@@ -955,6 +914,10 @@ function createSessionServer(
       }))
   );
 
+  registerWorkspaceTools(server, pool, auth, {
+    dormantAfterDays: options.workspaceDormantAfterDays ?? 30
+  });
+
   return server;
 }
 
@@ -966,6 +929,7 @@ export function registerMcpRoutes(
     logger?: Pick<Logger, 'debug' | 'warn'> | undefined;
     extractionEnabled?: boolean | undefined;
     resourceMetadataUrl?: string | undefined;
+    workspaceDormantAfterDays?: number | undefined;
   } = {}
 ): void {
   app.all('/mcp', async (c) => {
