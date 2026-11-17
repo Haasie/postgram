@@ -383,7 +383,6 @@ export function createPgmClient(options: RestClientOptions) {
     },
     diffSync(input: {
       repo: string;
-      visibility?: string | undefined;
       files: Array<{ path: string; sha: string }>;
     }) {
       return request<{
@@ -397,7 +396,6 @@ export function createPgmClient(options: RestClientOptions) {
     },
     uploadSyncFiles(input: {
       repo: string;
-      visibility?: string | undefined;
       files: Array<{ path: string; sha: string; content: string }>;
     }) {
       return request<{
@@ -410,12 +408,10 @@ export function createPgmClient(options: RestClientOptions) {
     },
     finalizeSync(input: {
       repo: string;
-      visibility?: string | undefined;
       files: Array<{ path: string; sha: string }>;
     }) {
       return request<{
         deleted: number;
-        reclassified?: number;
       }>(options, '/api/sync/finalize', {
         method: 'POST',
         body: input
