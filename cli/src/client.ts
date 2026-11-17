@@ -76,14 +76,15 @@ type ApiErrorBody = {
   };
 };
 
-type RestClientOptions = {
+export type RestClientOptions = {
   apiUrl: string;
   apiKey: string;
 };
 
-type RequestOptions = {
+export type RequestOptions = {
   method?: string | undefined;
   body?: unknown;
+  signal?: AbortSignal | undefined;
 };
 
 async function parseResponse<T>(response: Response): Promise<T> {
@@ -104,7 +105,7 @@ function normalizeErrorBody(body: unknown): ApiErrorBody {
   return body as ApiErrorBody;
 }
 
-async function request<T>(
+export async function request<T>(
   options: RestClientOptions,
   path: string,
   requestOptions: RequestOptions = {}
@@ -124,6 +125,10 @@ async function request<T>(
 
   if (requestOptions.body !== undefined) {
     init.body = JSON.stringify(requestOptions.body);
+  }
+
+  if (requestOptions.signal !== undefined) {
+    init.signal = requestOptions.signal;
   }
 
   const response = await fetch(`${options.apiUrl}${path}`, init);
@@ -314,8 +319,12 @@ export function createPgmClient(options: RestClientOptions) {
       limit?: number | undefined;
       offset?: number | undefined;
       include_archived?: boolean | undefined;
+      kind?: 'task' | 'feature' | 'all' | undefined;
     } = {}) {
       const params = new URLSearchParams();
+      if (input.kind) {
+        params.set('kind', input.kind);
+      }
       if (input.status) {
         params.set('status', input.status);
       }

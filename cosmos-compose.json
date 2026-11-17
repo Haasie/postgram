@@ -63,6 +63,8 @@
         "EMBEDDING_DIMENSIONS=1024",
         "EMBEDDING_BASE_URL=https://api.mistral.ai/v1",
         "EMBEDDING_API_KEY=YOUR_MISTRAL_API_KEY",
+        "SEARCH_DEFAULT_THRESHOLD=0.35",
+        "WORKSPACE_DORMANT_AFTER_DAYS=30",
         "EXTRACTION_ENABLED=false",
         "EXTRACTION_PROVIDER=openai-compatible",
         "EXTRACTION_BASE_URL=https://api.mistral.ai/v1",

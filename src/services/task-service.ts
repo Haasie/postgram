@@ -1,4 +1,4 @@
-import { ResultAsync } from 'neverthrow';
+import { errAsync, ResultAsync } from 'neverthrow';
 import type { Pool } from 'pg';
 
 import { requireScope } from '../auth/key-service.js';
@@ -13,6 +13,7 @@ import type {
 import { appendAuditEntry } from '../util/audit.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 import { storeEntity, updateEntity } from './entity-service.js';
+import { normalizeFeatureMetadata } from './feature-rules.js';
 
 type EntityRow = {
   id: string;
@@ -47,7 +48,12 @@ type ListTasksInput = {
   limit?: number | undefined;
   offset?: number | undefined;
   includeArchived?: boolean | undefined;
+  /** Features are tasks with metadata.kind = 'feature'. Default 'all'. */
+  kind?: TaskKindFilter | undefined;
 };
+
+export const TASK_KIND_FILTERS = ['task', 'feature', 'all'] as const;
+export type TaskKindFilter = (typeof TASK_KIND_FILTERS)[number];
 
 type UpdateTaskInput = {
   id: string;
@@ -133,19 +139,40 @@ export function createTask(
   pool: Pool,
   auth: AuthContext,
   input: CreateTaskInput
-) {
-  return storeEntity(pool, auth, {
-    type: 'task',
-    content: input.content,
-    status: input.status ?? 'inbox',
-    visibility: input.visibility,
-    tags: input.tags,
-    metadata: mergeTaskMetadata({
-      context: input.context,
-      dueDate: input.dueDate,
-      metadata: input.metadata
-    })
+): ServiceResult<Entity> {
+  const merged = mergeTaskMetadata({
+    context: input.context,
+    dueDate: input.dueDate,
+    metadata: input.metadata
   });
+
+  const baseStore = (
+    metadata: Record<string, unknown> | undefined
+  ): ServiceResult<Entity> =>
+    storeEntity(pool, auth, {
+      type: 'task',
+      content: input.content,
+      status: input.status ?? 'inbox',
+      visibility: input.visibility,
+      tags: input.tags,
+      metadata
+    });
+
+  if (merged?.kind !== 'feature') {
+    return baseStore(merged);
+  }
+
+  const normalized = normalizeFeatureMetadata({
+    next: merged,
+    previous: null,
+    now: new Date().toISOString()
+  });
+
+  if (normalized.isErr()) {
+    return errAsync(normalized.error);
+  }
+
+  return baseStore(normalized.value);
 }
 
 export function listTasks(
@@ -180,6 +207,10 @@ export function listTasks(
             AND ($2::boolean = true OR status IS DISTINCT FROM 'archived')
             AND ($3::text IS NULL OR metadata->>'context' = $3)
             AND visibility = ANY($4)
+            AND (
+              $7::text = 'all'
+              OR (metadata->>'kind' IS NOT DISTINCT FROM 'feature') = ($7::text = 'feature')
+            )
           ORDER BY created_at DESC
           LIMIT $5
           OFFSET $6
@@ -190,7 +221,8 @@ export function listTasks(
           input.context ?? null,
           auth.allowedVisibility,
           limit,
-          offset
+          offset,
+          input.kind ?? 'all'
         ]
       );
 
@@ -211,19 +243,73 @@ export function updateTask(
   pool: Pool,
   auth: AuthContext,
   input: UpdateTaskInput
-) {
-  return updateEntity(pool, auth, {
-    id: input.id,
-    version: input.version,
-    content: input.content,
-    status: input.status,
-    visibility: input.visibility,
-    tags: input.tags,
-    metadata: mergeTaskMetadata({
-      context: input.context,
-      dueDate: input.dueDate,
-      metadata: input.metadata
-    })
+): ServiceResult<Entity> {
+  const merged = mergeTaskMetadata({
+    context: input.context,
+    dueDate: input.dueDate,
+    metadata: input.metadata
+  });
+
+  const callUpdateEntity = (
+    metadata: Record<string, unknown> | undefined
+  ): ServiceResult<Entity> =>
+    updateEntity(pool, auth, {
+      id: input.id,
+      version: input.version,
+      content: input.content,
+      status: input.status,
+      visibility: input.visibility,
+      tags: input.tags,
+      metadata
+    });
+
+  if (merged === undefined) {
+    return callUpdateEntity(merged);
+  }
+
+  const inputMetadata: Record<string, unknown> = merged;
+
+  return ResultAsync.fromPromise(
+    (async () => {
+      const result = await pool.query<{
+        type: string;
+        visibility: Visibility;
+        metadata: Record<string, unknown>;
+      }>('SELECT type, visibility, metadata FROM entities WHERE id = $1', [
+        input.id
+      ]);
+      return result.rows[0] ?? null;
+    })(),
+    (error) => toAppError(error, 'Failed to load task')
+  ).andThen((row) => {
+    if (row === null || row.type !== 'task') {
+      return callUpdateEntity(merged);
+    }
+
+    if (
+      auth.allowedTypes !== null &&
+      !auth.allowedTypes.includes('task')
+    ) {
+      return callUpdateEntity(merged);
+    }
+
+    if (
+      !auth.allowedVisibility.includes(row.visibility)
+    ) {
+      return callUpdateEntity(merged);
+    }
+
+    const normalized = normalizeFeatureMetadata({
+      next: { ...row.metadata, ...inputMetadata },
+      previous: row.metadata,
+      now: new Date().toISOString()
+    });
+
+    if (normalized.isErr()) {
+      return errAsync(normalized.error);
+    }
+
+    return callUpdateEntity(normalized.value);
   });
 }
 

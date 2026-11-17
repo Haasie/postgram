@@ -30,10 +30,12 @@ describe('resolveEmbeddingDefaults', () => {
   });
 
   it('honors explicit overrides', () => {
-    expect(resolveEmbeddingDefaults('ollama', 'nomic-embed-text', 768)).toEqual({
-      model: 'nomic-embed-text',
-      dimensions: 768
-    });
+    expect(resolveEmbeddingDefaults('ollama', 'nomic-embed-text', 768)).toEqual(
+      {
+        model: 'nomic-embed-text',
+        dimensions: 768
+      }
+    );
   });
 });
 
@@ -58,7 +60,10 @@ describe('OpenAI embedding provider', () => {
 
     const vectors = await provider.embedBatch(['a', 'b']);
 
-    expect(vectors).toEqual([[0.3, 0.4], [0.1, 0.2]]);
+    expect(vectors).toEqual([
+      [0.3, 0.4],
+      [0.1, 0.2]
+    ]);
     const [params, options] = create.mock.calls[0] as [
       Record<string, unknown>,
       { signal?: AbortSignal } | undefined
@@ -243,10 +248,14 @@ describe('Ollama embedding provider', () => {
 
   it('loops sequentially for embedBatch and preserves order', async () => {
     let call = 0;
-    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => {
+    (
+      globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    ).mockImplementation(() => {
       call += 1;
       const embedding = call === 1 ? [1, 1] : [2, 2];
-      return Promise.resolve(new Response(JSON.stringify({ embedding }), { status: 200 }));
+      return Promise.resolve(
+        new Response(JSON.stringify({ embedding }), { status: 200 })
+      );
     });
 
     const provider = createEmbeddingProvider({
@@ -257,7 +266,10 @@ describe('Ollama embedding provider', () => {
     });
 
     const vectors = await provider.embedBatch(['a', 'b']);
-    expect(vectors).toEqual([[1, 1], [2, 2]]);
+    expect(vectors).toEqual([
+      [1, 1],
+      [2, 2]
+    ]);
     expect(call).toBe(2);
   });
 
@@ -276,9 +288,12 @@ describe('Ollama embedding provider', () => {
 
     await provider.embed('hi');
 
-    const call = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const call = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0];
     const init = call?.[1] as RequestInit;
-    expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer secret');
+    expect((init.headers as Record<string, string>)['Authorization']).toBe(
+      'Bearer secret'
+    );
   });
 
   it('throws EMBEDDING_FAILED on non-2xx', async () => {
@@ -295,7 +310,10 @@ describe('Ollama embedding provider', () => {
 
     await expect(provider.embed('hi')).rejects.toMatchObject({
       code: ErrorCode.EMBEDDING_FAILED,
-      details: expect.objectContaining({ status: 404 }) as Record<string, unknown>
+      details: expect.objectContaining({ status: 404 }) as Record<
+        string,
+        unknown
+      >
     });
   });
 
@@ -372,11 +390,13 @@ describe('OpenAI-compatible embedding provider', () => {
     baseUrl: 'https://api.mistral.ai/v1'
   };
 
-  it('resolves Mistral defaults', () => {
-    expect(resolveEmbeddingDefaults('openai-compatible')).toEqual({
-      model: 'mistral-embed-2312',
-      dimensions: 1024
-    });
+  it('has no default model or dimensions', () => {
+    expect(() => resolveEmbeddingDefaults('openai-compatible')).toThrow(
+      /EMBEDDING_MODEL and EMBEDDING_DIMENSIONS/
+    );
+    expect(
+      resolveEmbeddingDefaults('openai-compatible', 'mistral-embed', 1024)
+    ).toEqual({ model: 'mistral-embed', dimensions: 1024 });
   });
 
   it('pages large batches and passes an abort signal on every page', async () => {

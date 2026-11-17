@@ -30,7 +30,14 @@ import {
   uploadSyncFiles,
   finalizeSyncManifest
 } from '../services/sync-service.js';
-import { completeTask, createTask, listTasks, updateTask } from '../services/task-service.js';
+import {
+  completeTask,
+  createTask,
+  listTasks,
+  TASK_KIND_FILTERS,
+  updateTask
+} from '../services/task-service.js';
+import type { TaskKindFilter } from '../services/task-service.js';
 import type { Entity, EntityStatus, EntityType, Visibility } from '../types/entities.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 
@@ -46,6 +53,8 @@ const entityTypeSchema = z.enum([
 const visibilitySchema = z.enum(['personal', 'work', 'shared']);
 const ownerSchema = z.string().trim().min(1);
 const memoryRoleSchema = z.enum(['durable_memory', 'session_context']);
+
+const taskKindSchema = z.enum(TASK_KIND_FILTERS);
 
 const statusSchema = z.enum([
   'active',
@@ -246,7 +255,7 @@ function parseQueryNumber(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function toStoredEntity(entity: Entity) {
+export function toStoredEntity(entity: Entity) {
   return {
     id: entity.id,
     type: entity.type,
@@ -295,6 +304,7 @@ export function registerRestRoutes(
     embeddingService?: EmbeddingService | undefined;
     logger?: Pick<Logger, 'debug' | 'warn'> | undefined;
     extractionEnabled?: boolean | undefined;
+    searchDefaultThreshold?: number | undefined;
   } = {}
 ): void {
   app.post('/api/entities', async (c) => {
@@ -563,7 +573,8 @@ export function registerRestRoutes(
       },
       {
         embeddingService: options.embeddingService,
-        logger: options.logger
+        logger: options.logger,
+        defaultThreshold: options.searchDefaultThreshold
       }
     );
 
@@ -627,8 +638,13 @@ export function registerRestRoutes(
     }
 
     const includeArchived = c.req.query('include_archived') === 'true';
+    const kind = c.req.query('kind');
+    if (kind !== undefined && !taskKindSchema.safeParse(kind).success) {
+      throw toValidationError('Invalid task kind');
+    }
 
     const result = await listTasks(pool, auth, {
+      kind: kind as TaskKindFilter | undefined,
       status: status as EntityStatus | undefined,
       context: c.req.query('context') ?? undefined,
       limit: parseQueryNumber(c.req.query('limit'), 50),

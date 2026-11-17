@@ -1,3 +1,114 @@
+## [1.41.2](https://github.com/ivo-toby/postgram/compare/cli-v1.41.1...cli-v1.41.2) (2026-11-12)
+
+### Bug Fixes
+
+* **skill:** quote SKILL.md description so the frontmatter is valid YAML ([b65f85e](https://github.com/ivo-toby/postgram/commit/b65f85e3889b18f90f90581fec7bdf233bc7597d))
+
+## [1.41.1](https://github.com/ivo-toby/postgram/compare/cli-v1.41.0...cli-v1.41.1) (2026-11-05)
+
+### Bug Fixes
+
+* **ui:** never cache a missing asset for a year ([569f102](https://github.com/ivo-toby/postgram/commit/569f102f19f79245ab3d6ec11cf2e8303c653ea5))
+* **ui:** stop browsers from keeping an old index.html after a deploy ([b57eaff](https://github.com/ivo-toby/postgram/commit/b57eaff965c7346c40dbf8a1bdb16f56e3bbadbe))
+
+## [1.41.0](https://github.com/ivo-toby/postgram/compare/cli-v1.40.1...cli-v1.41.0) (2026-11-05)
+
+### Features
+
+* **ui:** add the read-only Where page and its tab ([bd49f59](https://github.com/ivo-toby/postgram/commit/bd49f5949ae3110d9d35ad059ec6d89cc3716ce3))
+* **ui:** add the where types, resume rendering and the useWhere hook ([85f7ffe](https://github.com/ivo-toby/postgram/commit/85f7ffebdd3ca6d86d79dc1f1aa681c417458510))
+* **ui:** make the Where page easier to read ([d4f63cb](https://github.com/ivo-toby/postgram/commit/d4f63cb2fe7b1309bfff91b443c5daba51bc3dab))
+* **ui:** show the Where page as swimlanes per project ([2635fa0](https://github.com/ivo-toby/postgram/commit/2635fa03765d50edd24884544988a29b1d686118))
+
+## [1.40.1](https://github.com/ivo-toby/postgram/compare/cli-v1.40.0...cli-v1.40.1) (2026-11-05)
+
+### Bug Fixes
+
+* **api:** reject a non-UUID entity id as VALIDATION instead of INTERNAL ([6652ef0](https://github.com/ivo-toby/postgram/commit/6652ef0f705a27f035ec50858e3e711210f8fc45))
+* **tasks:** keep features out of task lists ([9996d6c](https://github.com/ivo-toby/postgram/commit/9996d6c880821e2c79a61f6e9abff74ec28c0967))
+* **tracking:** do not register directories outside git ([0b5b5e4](https://github.com/ivo-toby/postgram/commit/0b5b5e40cca714e6bdb9c45904a4284cd81d9304))
+* **tracking:** offer and link only open features in pgm scan ([af17454](https://github.com/ivo-toby/postgram/commit/af17454f63b5bdd4714797d6c0375772de1749a9))
+* **tracking:** require a feature id in feature done and feature sync ([83bf889](https://github.com/ivo-toby/postgram/commit/83bf88971bc1ecf92a26392511c1d86e11642754))
+
+## [1.40.0](https://github.com/ivo-toby/postgram/compare/cli-v1.39.0...cli-v1.40.0) (2026-11-05)
+
+### Features
+
+* **tracking:** add ignore_paths to ~/.pgmrc and honour it in pgm here ([7accfc0](https://github.com/ivo-toby/postgram/commit/7accfc07728f4b6a2b065c36bd17f41ce828b9c5))
+* **tracking:** add pgm feature done and pgm feature sync ([9aa1bea](https://github.com/ivo-toby/postgram/commit/9aa1bea7a68fc549c6ef5306ec7e740782c3fc54))
+* **tracking:** add pgm scan --json and --apply, fail cleanly without a terminal ([e55e26d](https://github.com/ivo-toby/postgram/commit/e55e26d27aba85736f4058629aaf1d6c923dec18))
+* **tracking:** add pgm workspace prune ([5a2755a](https://github.com/ivo-toby/postgram/commit/5a2755a1b8b0b1005109d75e9b7510199f10e769))
+* **tracking:** add pgm worktree rm ([0b67a9d](https://github.com/ivo-toby/postgram/commit/0b67a9d1b6075e54708193e33579d2443758f4bf))
+* **tracking:** compact pgm where per feature with --expand and tail-preserving paths ([b826abc](https://github.com/ivo-toby/postgram/commit/b826abcaa130141aa11e8ba790dca8751a7728cd))
+* **workspaces:** add workspace delete endpoint and MCP tool ([3906ed5](https://github.com/ivo-toby/postgram/commit/3906ed559baecf00dc86fbe68800c833c49afcad))
+
+## [1.39.0](https://github.com/ivo-toby/postgram/compare/cli-v1.38.3...cli-v1.39.0) (2026-11-04)
+
+### Features
+
+* **cli:** add pgm here, pgm hooks and the pi extension ([f5e9a3b](https://github.com/ivo-toby/postgram/commit/f5e9a3b868dee56edbaa4ffbaea46446296788af))
+* **cli:** add pgm where, feature, machine, repo, worktree and scan ([ca90f10](https://github.com/ivo-toby/postgram/commit/ca90f103ffe22b89de9e0362767129f2d7f648fb))
+* **cli:** add the tracking config, API client and local git helpers ([6510201](https://github.com/ivo-toby/postgram/commit/651020159941da54e920f2f533562160c004f398))
+* **cli:** wire the tracking commands into pgm ([d9fe69c](https://github.com/ivo-toby/postgram/commit/d9fe69c9fa1bf1d6d6a58241d6956d51790a76b5))
+* **config:** add WORKSPACE_DORMANT_AFTER_DAYS ([1bfb32d](https://github.com/ivo-toby/postgram/commit/1bfb32dd5d348f02aceac83699dda74587697d7a))
+* **features:** add feature stage and pull request rules ([b115dfd](https://github.com/ivo-toby/postgram/commit/b115dfdceedd660af053a725c9149f20ca29ec5d))
+* **features:** attach pull requests and derive the stage ([3dd9ce5](https://github.com/ivo-toby/postgram/commit/3dd9ce5486a57cba75c744b12f3bcd3e33e3ced9))
+* **features:** create features, resolve feature ids and store repository settings ([76cd901](https://github.com/ivo-toby/postgram/commit/76cd9012e3be838c975db1ede3d3b77e6cfbed36))
+* **features:** set a feature stage by hand ([cd97e0d](https://github.com/ivo-toby/postgram/commit/cd97e0d0dfe41c0a82e8a90aecab3df282aed602))
+* **mcp:** add workspace, feature and where tools ([0a4cb08](https://github.com/ivo-toby/postgram/commit/0a4cb088368642549a4725e437191145d55e2b4c))
+* **rest:** add workspace, machine, feature and where routes ([c3c0384](https://github.com/ivo-toby/postgram/commit/c3c0384d905e907617c2fe26611debdce9f4bbdf))
+* **server:** register the where API and pass the dormancy setting ([81bfff1](https://github.com/ivo-toby/postgram/commit/81bfff1133117615ddad5748a0faaa90fdfd081f))
+* **tasks:** normalize feature metadata in createTask and updateTask ([d327617](https://github.com/ivo-toby/postgram/commit/d3276173085325167dcea05e86a264485af601f5))
+* **where:** list, look up and update workspaces and build the where views ([eda7041](https://github.com/ivo-toby/postgram/commit/eda70419a25c223384e19369fc5144e1d2a33aca))
+* **workspaces:** add the reportWorkspace transaction ([653cab2](https://github.com/ivo-toby/postgram/commit/653cab28a55c88eab3bf6f0be3fe99576554ef86))
+* **workspaces:** add workspace tracking schema and row types ([3c8b59f](https://github.com/ivo-toby/postgram/commit/3c8b59ffe4bb72117132060578ca860b01be06e5))
+* **workspaces:** normalize git remotes to host/owner/repo ([03e1353](https://github.com/ivo-toby/postgram/commit/03e13538562eec2c941d39f3119bcbd2029a7ed6))
+* **workspaces:** project workspace rows into the report view ([fb3eae7](https://github.com/ivo-toby/postgram/commit/fb3eae7a6693b5b23ec381ff5a767d74af78414b))
+* **workspaces:** store agent sessions and apply the reboot rule ([ffd27e0](https://github.com/ivo-toby/postgram/commit/ffd27e0763b07997fc242ad2f12bfb5b89bd141b))
+* **workspaces:** store machines, workspaces and feature links ([9bc4dee](https://github.com/ivo-toby/postgram/commit/9bc4dee95d94d65bc9beb1646693cd67198d7bf5))
+* **workspaces:** validate workspace report input ([4cd5756](https://github.com/ivo-toby/postgram/commit/4cd575618ad5d3c6ae19e60aa3388be7c193972b))
+
+## [1.38.3](https://github.com/ivo-toby/postgram/compare/cli-v1.38.2...cli-v1.38.3) (2026-11-02)
+
+### Bug Fixes
+
+* **db:** handle idle and checked-out pg client errors to prevent unhandled crash ([#115](https://github.com/ivo-toby/postgram/issues/115)) ([197c451](https://github.com/ivo-toby/postgram/commit/197c4517b5c8b671e40d83702640a22249744ac2))
+
+## [1.38.2](https://github.com/ivo-toby/postgram/compare/cli-v1.38.1...cli-v1.38.2) (2026-10-31)
+
+### Bug Fixes
+
+* **enrichment:** don't re-queue graph extraction on re-embed of unchanged content ([#121](https://github.com/ivo-toby/postgram/issues/121)) ([0364ddc](https://github.com/ivo-toby/postgram/commit/0364ddc5bd2665bc11bf7e488c73517476cdc394)), closes [#120](https://github.com/ivo-toby/postgram/issues/120)
+
+## [1.38.1](https://github.com/ivo-toby/postgram/compare/cli-v1.38.0...cli-v1.38.1) (2026-10-31)
+
+### Bug Fixes
+
+* **llm:** normalize JSON schemas for OpenAI strict structured outputs ([#118](https://github.com/ivo-toby/postgram/issues/118)) ([58fc7c7](https://github.com/ivo-toby/postgram/commit/58fc7c70fd5e352f3a7c9d13d4d20d778272be32))
+
+## [1.38.0](https://github.com/ivo-toby/postgram/compare/cli-v1.37.3...cli-v1.38.0) (2026-10-31)
+
+### Features
+
+* support Mistral-style OpenAI-compatible providers ([#119](https://github.com/ivo-toby/postgram/issues/119)) ([c8f5997](https://github.com/ivo-toby/postgram/commit/c8f5997b55fc9c42447a748dfb959dc368f169f3))
+
+## [1.37.3](https://github.com/ivo-toby/postgram/compare/cli-v1.37.2...cli-v1.37.3) (2026-10-14)
+
+### Bug Fixes
+
+* retrieve keyword candidates with chunk rank fusion [[#114](https://github.com/ivo-toby/postgram/issues/114)] ([#116](https://github.com/ivo-toby/postgram/issues/116)) ([f027e8a](https://github.com/ivo-toby/postgram/commit/f027e8ad3da2db8d084b41b5dafed7d3a84d76b9))
+
+## [Unreleased]
+
+### Changed
+
+* **search:** Scores now use relative RRF values, typically about `0.008`–`0.033`,
+  and can shift when vector or keyword branch membership and ranks change.
+  `--threshold` is a cosine similarity floor rather than a fused-score
+  threshold; below-floor keyword matches require at least half of the retained
+  distinct query terms, rounded up. Existing stored thresholds may return looser
+  results, so retune clients during migration.
+
 ## [1.37.2](https://github.com/ivo-toby/postgram/compare/cli-v1.37.1...cli-v1.37.2) (2026-10-08)
 
 ### Bug Fixes
