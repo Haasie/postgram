@@ -1030,6 +1030,10 @@ program
   .argument('<dir>', 'directory path to sync')
   .option('--repo <name>', 'repo identifier (defaults to directory name)')
   .option('--dry-run', 'show what would change without syncing')
+  .option(
+    '--visibility <visibility>',
+    'visibility for every document of this repo (personal, work or shared); existing documents are moved to it'
+  )
   .option('--quiet', 'suppress output')
   .action(async (dir, options, command) => {
     const json = isJsonMode(command);
@@ -1037,6 +1041,14 @@ program
     try {
       const resolvedDir = path.resolve(dir);
       const repoName = options.repo ?? path.basename(resolvedDir);
+      const visibility: string | undefined = options.visibility;
+      if (visibility !== undefined && !['personal', 'work', 'shared'].includes(visibility)) {
+        throw new AppError(
+          ErrorCode.VALIDATION,
+          `Invalid --visibility '${visibility}' (use personal, work or shared)`
+        );
+      }
+      const visibilityField = visibility !== undefined ? { visibility } : {};
 
       const manifest = await buildSyncManifest(resolvedDir);
 
@@ -1049,7 +1061,8 @@ program
       }));
       const diff = await client.diffSync({
         repo: repoName,
-        files: manifestForServer
+        files: manifestForServer,
+        ...visibilityField
       });
 
       if (options.dryRun) {
@@ -1087,7 +1100,8 @@ program
         if (batch.length === 0) return;
         const result = await client.uploadSyncFiles({
           repo: repoName,
-          files: batch
+          files: batch,
+          ...visibilityField
         });
         totalCreated += result.created;
         totalUpdated += result.updated;
@@ -1118,21 +1132,27 @@ program
 
       const finalize = await client.finalizeSync({
         repo: repoName,
-        files: manifestForServer
+        files: manifestForServer,
+        ...visibilityField
       });
 
       const result = {
         created: totalCreated,
         updated: totalUpdated,
         unchanged: diff.unchanged,
-        deleted: finalize.deleted
+        deleted: finalize.deleted,
+        ...(finalize.reclassified !== undefined ? { reclassified: finalize.reclassified } : {})
       };
 
       if (json) {
         printJson(result);
       } else if (!options.quiet) {
+        const moved =
+          finalize.reclassified !== undefined
+            ? `, ${finalize.reclassified} moved to ${visibility}`
+            : '';
         printHuman([
-          `Synced ${repoName}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.deleted} deleted`
+          `Synced ${repoName}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.deleted} deleted${moved}`
         ]);
       }
     } catch (error) {

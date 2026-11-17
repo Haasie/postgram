@@ -5,6 +5,7 @@ import type { Pool } from 'pg';
 
 import { checkTypeAccess, checkVisibilityAccess, requireScope } from '../auth/key-service.js';
 import type { AuthContext } from '../auth/types.js';
+import type { Visibility } from '../types/entities.js';
 import type { ServiceResult } from '../types/common.js';
 import { appendAuditEntry } from '../util/audit.js';
 import { AppError, ErrorCode } from '../util/errors.js';
@@ -21,9 +22,13 @@ export function extractTitle(content: string, filePath: string): string {
   return basename;
 }
 
+/** Synced documents are 'shared' unless the caller asks for another visibility for the whole repo. */
+export const DEFAULT_SYNC_VISIBILITY: Visibility = 'shared';
+
 type SyncManifestInput = {
   repo: string;
   files: Array<{ path: string; sha: string; content: string }>;
+  visibility?: Visibility | undefined;
 };
 
 type SyncResult = {
@@ -31,11 +36,13 @@ type SyncResult = {
   updated: number;
   unchanged: number;
   deleted: number;
+  reclassified?: number;
 };
 
 export type SyncDiffInput = {
   repo: string;
   files: Array<{ path: string; sha: string }>;
+  visibility?: Visibility | undefined;
 };
 
 export type SyncDiffResult = {
@@ -47,6 +54,7 @@ export type SyncDiffResult = {
 export type SyncUploadInput = {
   repo: string;
   files: Array<{ path: string; sha: string; content: string }>;
+  visibility?: Visibility | undefined;
 };
 
 export type SyncUploadResult = {
@@ -57,11 +65,38 @@ export type SyncUploadResult = {
 export type SyncFinalizeInput = {
   repo: string;
   files: Array<{ path: string; sha: string }>;
+  visibility?: Visibility | undefined;
 };
 
 export type SyncFinalizeResult = {
   deleted: number;
+  /** Documents of this repo moved to the requested visibility (only when `visibility` is given). */
+  reclassified?: number;
 };
+
+/**
+ * Move every document of a repo to one visibility. Runs only when the caller passes `visibility`,
+ * so a repo that never asks keeps whatever it has. Returns how many documents changed.
+ */
+async function reclassifyRepo(
+  client: { query: Pool['query'] },
+  repo: string,
+  visibility: Visibility
+): Promise<number> {
+  const result = await client.query(
+    `
+      UPDATE entities e
+      SET visibility = $2,
+          version = e.version + 1
+      FROM document_sources ds
+      WHERE ds.entity_id = e.id
+        AND ds.repo = $1
+        AND e.visibility <> $2
+    `,
+    [repo, visibility]
+  );
+  return result.rowCount ?? 0;
+}
 
 type DocumentSourceRow = {
   id: string;
@@ -111,7 +146,8 @@ export function syncManifest(
       requireScope(auth, 'write');
       requireScope(auth, 'delete');
       checkTypeAccess(auth, 'document');
-      checkVisibilityAccess(auth, 'shared');
+      const visibility = input.visibility ?? DEFAULT_SYNC_VISIBILITY;
+      checkVisibilityAccess(auth, visibility);
 
       const client = await pool.connect();
       try {
@@ -142,12 +178,13 @@ export function syncManifest(
             const entityResult = await client.query<{ id: string }>(
               `
                 INSERT INTO entities (type, content, visibility, enrichment_status, metadata)
-                VALUES ('document', $1, 'shared', 'pending', $2)
+                VALUES ('document', $1, $3, 'pending', $2)
                 RETURNING id
               `,
               [
                 file.content,
-                JSON.stringify({ repo: input.repo, path: file.path, title })
+                JSON.stringify({ repo: input.repo, path: file.path, title }),
+                visibility
               ]
             );
             const entityId = entityResult.rows[0]?.id;
@@ -247,15 +284,28 @@ export function syncManifest(
           }
         }
 
+        const reclassified = input.visibility
+          ? await reclassifyRepo(client, input.repo, input.visibility)
+          : undefined;
+
         await client.query('COMMIT');
 
         await appendAuditEntry(pool, {
           apiKeyId: auth.apiKeyId,
           operation: 'sync.complete',
-          details: { repo: input.repo, created, updated, unchanged, deleted }
+          details: {
+            repo: input.repo,
+            created,
+            updated,
+            unchanged,
+            deleted,
+            ...(reclassified !== undefined ? { visibility, reclassified } : {})
+          }
         });
 
-        return { created, updated, unchanged, deleted };
+        return reclassified !== undefined
+          ? { created, updated, unchanged, deleted, reclassified }
+          : { created, updated, unchanged, deleted };
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;
@@ -276,7 +326,8 @@ export function diffSyncManifest(
     (async () => {
       requireScope(auth, 'read');
       checkTypeAccess(auth, 'document');
-      checkVisibilityAccess(auth, 'shared');
+      const visibility = input.visibility ?? DEFAULT_SYNC_VISIBILITY;
+      checkVisibilityAccess(auth, visibility);
 
       const existingRows = await pool.query<DocumentSourceRow>(
         'SELECT id, entity_id, path, sha, sync_status FROM document_sources WHERE repo = $1',
@@ -327,7 +378,8 @@ export function uploadSyncFiles(
     (async () => {
       requireScope(auth, 'write');
       checkTypeAccess(auth, 'document');
-      checkVisibilityAccess(auth, 'shared');
+      const visibility = input.visibility ?? DEFAULT_SYNC_VISIBILITY;
+      checkVisibilityAccess(auth, visibility);
 
       const client = await pool.connect();
       try {
@@ -348,12 +400,13 @@ export function uploadSyncFiles(
             const entityResult = await client.query<{ id: string }>(
               `
                 INSERT INTO entities (type, content, visibility, enrichment_status, metadata)
-                VALUES ('document', $1, 'shared', 'pending', $2)
+                VALUES ('document', $1, $3, 'pending', $2)
                 RETURNING id
               `,
               [
                 file.content,
-                JSON.stringify({ repo: input.repo, path: file.path, title })
+                JSON.stringify({ repo: input.repo, path: file.path, title }),
+                visibility
               ]
             );
             const entityId = entityResult.rows[0]?.id;
@@ -445,7 +498,8 @@ export function finalizeSyncManifest(
       requireScope(auth, 'write');
       requireScope(auth, 'delete');
       checkTypeAccess(auth, 'document');
-      checkVisibilityAccess(auth, 'shared');
+      const visibility = input.visibility ?? DEFAULT_SYNC_VISIBILITY;
+      checkVisibilityAccess(auth, visibility);
 
       const client = await pool.connect();
       try {
@@ -502,15 +556,24 @@ export function finalizeSyncManifest(
           }
         }
 
+        const reclassified = input.visibility
+          ? await reclassifyRepo(client, input.repo, input.visibility)
+          : undefined;
+
         await client.query('COMMIT');
 
         await appendAuditEntry(pool, {
           apiKeyId: auth.apiKeyId,
           operation: 'sync.finalize',
-          details: { repo: input.repo, deleted, manifestFiles: input.files.length }
+          details: {
+            repo: input.repo,
+            deleted,
+            manifestFiles: input.files.length,
+            ...(reclassified !== undefined ? { visibility, reclassified } : {})
+          }
         });
 
-        return { deleted };
+        return reclassified !== undefined ? { deleted, reclassified } : { deleted };
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;

@@ -186,6 +186,7 @@ const bulkArchiveEntitiesSchema = z.object({
 
 const syncManifestSchema = z.object({
   repo: z.string().min(1),
+  visibility: visibilitySchema.optional(),
   files: z.array(
     z.object({
       path: z.string().min(1),
@@ -197,6 +198,7 @@ const syncManifestSchema = z.object({
 
 const syncDiffSchema = z.object({
   repo: z.string().min(1),
+  visibility: visibilitySchema.optional(),
   files: z.array(
     z.object({
       path: z.string().min(1),
@@ -207,6 +209,7 @@ const syncDiffSchema = z.object({
 
 const syncUploadSchema = z.object({
   repo: z.string().min(1),
+  visibility: visibilitySchema.optional(),
   files: z
     .array(
       z.object({
@@ -220,6 +223,7 @@ const syncUploadSchema = z.object({
 
 const syncFinalizeSchema = z.object({
   repo: z.string().min(1),
+  visibility: visibilitySchema.optional(),
   files: z.array(
     z.object({
       path: z.string().min(1),
