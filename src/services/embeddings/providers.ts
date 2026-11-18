@@ -1,7 +1,4 @@
-import OpenAI, {
-  APIConnectionTimeoutError,
-  APIUserAbortError
-} from 'openai';
+import OpenAI, { APIConnectionTimeoutError, APIUserAbortError } from 'openai';
 
 import {
   AppError,
@@ -59,8 +56,6 @@ const OLLAMA_DEFAULT_DIMENSIONS = 1024;
 // The width matches, the vector space does not: switching between the two
 // without re-embedding (pgm-admin embeddings migrate) yields meaningless
 // similarity scores.
-const OPENAI_COMPATIBLE_DEFAULT_MODEL = 'mistral-embed-2312';
-const OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS = 1024;
 // Hosted OpenAI-compatible endpoints cap inputs per request; chunking a large
 // note can yield hundreds of chunks, so page them.
 export const OPENAI_COMPATIBLE_MAX_BATCH_INPUTS = 64;
@@ -131,10 +126,14 @@ export function resolveEmbeddingDefaults(
     };
   }
   if (provider === 'openai-compatible') {
-    return {
-      model: model ?? OPENAI_COMPATIBLE_DEFAULT_MODEL,
-      dimensions: dimensions ?? OPENAI_COMPATIBLE_DEFAULT_DIMENSIONS
-    };
+    // A generic endpoint has no model we could sensibly default to.
+    if (model === undefined || dimensions === undefined) {
+      throw new AppError(
+        ErrorCode.VALIDATION,
+        'EMBEDDING_MODEL and EMBEDDING_DIMENSIONS are required for EMBEDDING_PROVIDER=openai-compatible'
+      );
+    }
+    return { model, dimensions };
   }
   return {
     model: model ?? OLLAMA_DEFAULT_MODEL,
@@ -158,7 +157,10 @@ type OpenAIEmbeddingClient = {
   };
 };
 
-function embeddingError(message: string, details: Record<string, unknown> = {}): AppError {
+function embeddingError(
+  message: string,
+  details: Record<string, unknown> = {}
+): AppError {
   return new AppError(ErrorCode.EMBEDDING_FAILED, message, details);
 }
 
@@ -222,7 +224,8 @@ export function createOpenAIEmbeddingProvider(
       // Pass `dimensions` to OpenAI when the operator has chosen a non-default
       // size. text-embedding-3-small/large accept this parameter and truncate
       // via Matryoshka; older models (ada-002) will reject it at the API.
-      const nonDefaultDimensions = config.dimensions !== OPENAI_DEFAULT_DIMENSIONS;
+      const nonDefaultDimensions =
+        config.dimensions !== OPENAI_DEFAULT_DIMENSIONS;
       const response = await client.embeddings.create(
         {
           model: config.model,
@@ -239,12 +242,15 @@ export function createOpenAIEmbeddingProvider(
         .map((item) => item.embedding);
 
       if (ordered.length !== texts.length) {
-        throw embeddingError('Embedding API returned an unexpected number of vectors', {
-          provider: 'openai',
-          model: config.model,
-          expected: texts.length,
-          actual: ordered.length
-        });
+        throw embeddingError(
+          'Embedding API returned an unexpected number of vectors',
+          {
+            provider: 'openai',
+            model: config.model,
+            expected: texts.length,
+            actual: ordered.length
+          }
+        );
       }
 
       for (const vector of ordered) {
@@ -327,12 +333,15 @@ export function createOllamaEmbeddingProvider(
 
     let response: Response;
     try {
-      response = await (config.fetchImpl ?? fetch)(`${baseUrl}/api/embeddings`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ model: config.model, prompt }),
-        signal: controller.signal
-      });
+      response = await (config.fetchImpl ?? fetch)(
+        `${baseUrl}/api/embeddings`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model: config.model, prompt }),
+          signal: controller.signal
+        }
+      );
     } catch (error) {
       if (controller.signal.aborted) {
         throw embeddingError(
@@ -375,11 +384,14 @@ export function createOllamaEmbeddingProvider(
       }
       const message =
         error instanceof Error ? error.message : 'Invalid JSON from Ollama';
-      throw embeddingError(`Ollama returned an unreadable response: ${message}`, {
-        provider: 'ollama',
-        model: config.model,
-        baseUrl
-      });
+      throw embeddingError(
+        `Ollama returned an unreadable response: ${message}`,
+        {
+          provider: 'ollama',
+          model: config.model,
+          baseUrl
+        }
+      );
     }
     if (!body.embedding) {
       throw embeddingError('Ollama response missing embedding field', {
@@ -389,7 +401,12 @@ export function createOllamaEmbeddingProvider(
       });
     }
 
-    assertVectorShape(body.embedding, config.dimensions, 'ollama', config.model);
+    assertVectorShape(
+      body.embedding,
+      config.dimensions,
+      'ollama',
+      config.model
+    );
     return body.embedding;
   }
 
@@ -423,6 +440,11 @@ async function safeReadSnippet(response: Response): Promise<string> {
   }
 }
 
+// FORK-ONLY: the fork keeps its OpenAI-SDK based provider instead of
+// upstream's fetch-based one (ivo-toby/postgram#119). It maps HTTP 429 to
+// RateLimitError (the enrichment worker's backoff depends on that), pages by
+// input count and total characters, and lets the SDK retry nothing by default.
+// It never sends `dimensions`: Mistral rejects unknown fields with a 422.
 export function createOpenAICompatibleEmbeddingProvider(
   config: Extract<EmbeddingProviderConfig, { provider: 'openai-compatible' }>,
   clientOverride?: OpenAIEmbeddingClient

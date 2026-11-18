@@ -10,6 +10,41 @@ function baseEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
 }
 
 describe('config', () => {
+  it('accepts an openai-compatible embedding provider with a base URL', () => {
+    const cfg = loadConfig(
+      baseEnv({
+        EMBEDDING_PROVIDER: 'openai-compatible',
+        EMBEDDING_BASE_URL: 'https://api.mistral.ai/v1',
+        EMBEDDING_MODEL: 'mistral-embed',
+        EMBEDDING_DIMENSIONS: '1024'
+      })
+    );
+    expect(cfg.EMBEDDING_PROVIDER).toBe('openai-compatible');
+  });
+
+  it('requires EMBEDDING_BASE_URL for the openai-compatible embedding provider', () => {
+    expect(() =>
+      loadConfig(
+        baseEnv({
+          EMBEDDING_PROVIDER: 'openai-compatible',
+          EMBEDDING_MODEL: 'mistral-embed',
+          EMBEDDING_DIMENSIONS: '1024'
+        })
+      )
+    ).toThrow(/EMBEDDING_BASE_URL is required/);
+  });
+
+  it('defaults and validates the default search threshold', () => {
+    expect(loadConfig(baseEnv()).SEARCH_DEFAULT_THRESHOLD).toBe(0.35);
+    expect(
+      loadConfig(baseEnv({ SEARCH_DEFAULT_THRESHOLD: '0.65' }))
+        .SEARCH_DEFAULT_THRESHOLD
+    ).toBe(0.65);
+    expect(loadConfig(baseEnv({ SEARCH_DEFAULT_THRESHOLD: '' })).SEARCH_DEFAULT_THRESHOLD).toBe(0.35);
+    expect(() => loadConfig(baseEnv({ SEARCH_DEFAULT_THRESHOLD: '1.5' }))).toThrow();
+    expect(() => loadConfig(baseEnv({ SEARCH_DEFAULT_THRESHOLD: '-0.1' }))).toThrow();
+  });
+
   it('defaults and validates the embedding provider timeout', () => {
     expect(loadConfig(baseEnv()).EMBEDDING_TIMEOUT_MS).toBe(15000);
     expect(
@@ -110,18 +145,6 @@ describe('config', () => {
     expect(cfg.EXTRACTION_BASE_URL).toBe('http://host.docker.internal:8000/v1');
     expect(cfg.EXTRACTION_API_KEY).toBe('local-key');
     expect(cfg.OPENAI_API_KEY).toBeUndefined();
-  });
-
-  it('allows OpenAI-compatible embeddings without env base URL so DB-backed settings can supersede', () => {
-    const cfg = loadConfig(
-      baseEnv({
-        EMBEDDING_PROVIDER: 'openai-compatible',
-        OPENAI_API_KEY: 'sk-x'
-      })
-    );
-
-    expect(cfg.EMBEDDING_PROVIDER).toBe('openai-compatible');
-    expect(cfg.EMBEDDING_BASE_URL).toBeUndefined();
   });
 
   it('defaults and validates the rate limit backoff', () => {
@@ -348,6 +371,40 @@ describe('buildEmbeddingProviderConfig', () => {
       model: 'text-embedding-3-large',
       dimensions: 3072
     });
+  });
+});
+
+describe('buildEmbeddingProviderConfig for openai-compatible', () => {
+  it('uses the embedding base URL and API key', async () => {
+    const { buildEmbeddingProviderConfig } = await import('../../src/index.js');
+    const cfg = loadConfig(
+      baseEnv({
+        EMBEDDING_PROVIDER: 'openai-compatible',
+        EMBEDDING_BASE_URL: 'https://api.mistral.ai/v1',
+        EMBEDDING_API_KEY: 'mk-test',
+        EMBEDDING_MODEL: 'mistral-embed',
+        EMBEDDING_DIMENSIONS: '1024'
+      })
+    );
+    expect(buildEmbeddingProviderConfig(cfg)).toMatchObject({
+      provider: 'openai-compatible',
+      model: 'mistral-embed',
+      dimensions: 1024,
+      baseUrl: 'https://api.mistral.ai/v1',
+      apiKey: 'mk-test'
+    });
+  });
+
+  it('requires an explicit model and dimensions', () => {
+    expect(() =>
+      loadConfig(
+        baseEnv({
+          EMBEDDING_PROVIDER: 'openai-compatible',
+          EMBEDDING_BASE_URL: 'https://api.mistral.ai/v1',
+          EMBEDDING_MODEL: 'mistral-embed'
+        })
+      )
+    ).toThrow(/EMBEDDING_MODEL and EMBEDDING_DIMENSIONS are required/);
   });
 });
 

@@ -174,7 +174,7 @@ Postgram provides:
 
 - durable storage for typed entities: `memory`, `person`, `project`, `task`,
   `interaction`, `document`
-- hybrid BM25 + vector search with asynchronous enrichment
+- hybrid keyword + vector search with asynchronous enrichment
 - knowledge graph with typed directional edges between entities
 - LLM-powered relationship extraction (OpenAI, Anthropic, or Ollama)
 - document sync from local markdown repos via manifest comparison
@@ -209,7 +209,8 @@ High-level flow:
 3. enrichment runs asynchronously: chunking, embedding, and optionally LLM extraction
 4. chunks and embeddings are produced in the background
 5. edges are created from extracted relationships (if extraction is enabled)
-6. search queries use hybrid BM25 + vector scoring, with optional graph expansion
+6. search queries use hybrid keyword + vector retrieval and reciprocal-rank
+   fusion, with optional graph expansion
 
 ## Main Features
 
@@ -326,18 +327,66 @@ entities are retried up to 3 times with a 5-minute backoff.
 
 ### 3. Hybrid Search
 
-Search blends vector cosine similarity (60%) with BM25 keyword ranking (40%)
-transparently. Broad searches select candidates through the HNSW index; small
-filtered sets use exact distance ranking, and HNSW falls back to exact ranking
-when its candidate scan cannot fill its target. Search requires a reachable
+Search retrieves vector neighbors and chunks matching query lexemes, then
+deduplicates chunks and ranks them with reciprocal-rank fusion (RRF):
+`1 / (60 + vector_rank) + 1 / (60 + keyword_rank)`. A missing branch
+contributes zero. Keyword retrieval splits a query into whitespace-separated
+terms. Each term's `simple` lexemes are ANDed, while non-empty terms are ORed,
+preserving compound identifiers such as `ABC-1234`; a long query can therefore
+admit a chunk matching one complete term. For multi-term queries, terms whose
+English dictionary vector is empty (standalone English stopwords) are omitted;
+a single term is retained even when that vector is empty. Matching and ranking
+still use PostgreSQL's `simple` configuration. Broad searches select candidates
+through the HNSW index; small filtered sets use exact distance ranking, and HNSW
+falls back to exact ranking when its candidate scan cannot fill its target.
+Keyword parsing retains the first 24 distinct non-empty term queries after
+multi-term English stopword filtering, while embeddings use the full original
+query text.
+
+Keyword candidate generation starts with a full conjunction probe over all
+retained terms, capped at 200 authorized GIN hits. If it fills the cap, it is
+the keyword pool and all other probes are skipped; a single retained term
+reuses this same probe. Otherwise, an authorized OR probe capped at 201 checks
+whether the complete union fits the 200-chunk pool. A union of at most 200
+chunks is used in full without per-term scans; a 201-hit union falls back to
+independent per-term probes and the existing rarity/compound selection for the
+200-chunk pool. Full-conjunction hits stay first in that fallback. Only the
+full AND query deduplicates lexemes; lexical OR scoring remains unchanged.
+When a capped probe has more authorized hits than its cap, its unordered
+membership may vary. `ts_rank_cd` and keyword ranks are therefore approximate
+within this bounded pool, just as vector ranks are bounded by their candidate
+retrieval.
+
+If the full conjunction does not fill the pool and the OR probe saturates, a
+qualifying partial match such as five of six common terms can still fall
+outside the bounded probe membership. This is an accepted current limitation;
+evaluation may motivate later intersection probes.
+
+`threshold` is a cosine similarity floor from 0 to 1. A candidate passes when
+its vector similarity meets the floor or its chunk matches at least half of the
+retained distinct keyword terms, rounded up. A single-term query, including a
+compound identifier such as `ABC-1234`, requires its one retained term. Partial
+keyword candidates remain eligible when they meet the vector floor or this
+coverage rule. The returned
+`score` is the relative RRF ordering value, not a probability or percentage;
+`similarity` remains the raw cosine value. An optional recency multiplier uses
+a true 30-day half-life. A candidate ranked first in both branches scores
+about `0.03279` before recency. Equal final scores prefer the lower keyword
+rank, then vector rank, then stable identifiers. Search requires a reachable
 embedding provider; if that provider is unavailable, writes still succeed but
 enrichment and search fail until it recovers. Results include:
 
-- ranked results with blended scores
-- similarity scores
-- recency-adjusted scores
+- ranked results with relative RRF scores
+- cosine similarity values
+- recency-adjusted RRF scores
 - matching chunk text
 - optional 1-hop graph neighbors (`expand_graph` parameter)
+
+Migration 017 adds an expression GIN index on `to_tsvector('simple',
+chunks.content)`. The normal transactional `CREATE INDEX` keeps reads
+available while migration runs, but writes to `chunks` wait until the
+migration commits. It does not rewrite the table heap. The migration runner
+cannot use `CREATE INDEX CONCURRENTLY`, so schedule startup accordingly.
 
 <p align="center">
   <img src="assets/search.png" alt="Hybrid search results in Postgram" />
@@ -412,6 +461,11 @@ Tasks are first-class entities with convenience operations for:
 - list (filtered by status and context)
 - update
 - complete (with completion timestamp)
+
+Features are tasks with a delivery stage. Postgram tracks which machine,
+worktree and agent session each feature lives in, and shows what needs you
+next with `pgm where`. See [docs/workspace-tracking.md](docs/workspace-tracking.md)
+for onboarding and daily use.
 
 ### 9. Multiple Interfaces
 
@@ -635,21 +689,23 @@ those values outside database backups and browser storage.
 | `PUBLIC_BASE_URL`             | conditional |         | Public HTTPS origin for OAuth metadata and callback URLs. Required when `OAUTH_ENABLED=true`. Example: `https://postgram.example.com`. |
 | `LOG_LEVEL`                   | no          | `info`  | pino log level                                                                                                                 |
 | `ENRICHMENT_POLL_INTERVAL_MS` | no          | `1000`  | Enrichment worker poll interval                                                                                                |
+| `WORKSPACE_DORMANT_AFTER_DAYS` | no         | `30`    | Days without activity after which a running or idle agent session is shown as dormant. Informational only.                      |
 
 ### Embeddings
 
 | Variable               | Required             | Default                         | Description                                                                                                                     |
 | ---------------------- | -------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `EMBEDDING_PROVIDER`   | no                   | `openai` (Compose auto-selects) | `openai`, `ollama` or `openai-compatible` (e.g. Mistral Embed). Compose keeps OpenAI when `OPENAI_API_KEY` is present, otherwise chooses Ollama unless explicitly set. |
-| `EMBEDDING_MODEL`      | no                   | per-provider                    | Defaults: `text-embedding-3-small` (openai, 1536 dims), `bge-m3` (ollama, 1024 dims), `mistral-embed-2312` (openai-compatible, 1024 dims). Changing model needs a re-embed (`embeddings migrate`) even at equal dimensions.                                         |
-| `EMBEDDING_DIMENSIONS` | no                   | per-provider                    | Must match the active `embedding_models` row. Run `./bin/pgm-admin embeddings migrate --target-dimensions <N> --yes` to change. |
-| `EMBEDDING_BASE_URL`   | when provider=ollama or openai-compatible | falls back to `OLLAMA_BASE_URL` (ollama only) | Embedding host. Independent from LLM-extraction host so embeddings and inference can target different machines.                 |
+| `EMBEDDING_PROVIDER`   | no                   | `openai` (Compose auto-selects) | `openai`, `ollama`, or `openai-compatible`. Compose keeps OpenAI when `OPENAI_API_KEY` is present, otherwise chooses Ollama unless explicitly set. `openai-compatible` calls any OpenAI-style `/embeddings` API, such as Mistral, and never sends a `dimensions` field. |
+| `EMBEDDING_MODEL`      | when provider=openai-compatible | per-provider          | Defaults: `text-embedding-3-small` (openai, 1536 dims), `bge-m3` (ollama, 1024 dims). No default for `openai-compatible`.        |
+| `EMBEDDING_DIMENSIONS` | when provider=openai-compatible | per-provider          | Must match the active `embedding_models` row. Run `./bin/pgm-admin embeddings migrate --target-dimensions <N> --yes` to change. |
+| `EMBEDDING_BASE_URL`   | when provider=ollama or openai-compatible | ollama: falls back to `OLLAMA_BASE_URL` | Embedding host. For `openai-compatible`, include any `/v1` path; Postgram appends `/embeddings` (Mistral: `https://api.mistral.ai/v1`). For Ollama it is independent from the LLM-extraction host so embeddings and inference can target different machines. |
 | `EMBEDDING_API_KEY`    | no                   |                                 | Optional bearer token for `EMBEDDING_BASE_URL`.                                                                                 |
 | `EXTRACTION_RATE_LIMIT_BACKOFF_MS` | no | `60000` | Base pause after an upstream HTTP 429 (embedding or extraction). Doubles per consecutive throttled pass up to 16x, plus up to 25% jitter; the throttled entity gets the same per-entity cooldown so the rest of the queue keeps moving. Entities stay `pending`; after 20 consecutive 429s one counts as a failed attempt. `0` disables the pause. |
 | `EMBEDDING_TIMEOUT_MS` | no                   | `15000`                         | Hard timeout for a single embedding provider call. Bounds how long one stalled call can delay a request. |
 | `QUERY_EMBEDDING_CACHE_SIZE` | no             | `512`                           | In-process query embeddings held in front of the Postgres-backed cache. |
 | `QUERY_EMBEDDING_CACHE_SECRET` | no           |                                 | Keys the query digest with an HMAC. Without it the digest is an unkeyed sha256, which a reader of the database can dictionary-test to confirm whether a guessed query was run. Set it if you treat query text as more sensitive than entity content; it must live outside the database to mean anything. Changing it invalidates existing cache rows. |
 | `QUERY_EMBEDDING_CACHE_RETENTION_DAYS` | no   | `30`                            | Age at which persisted query embeddings are pruned. The hourly prune also retains only the 2,000 newest entries per client. |
+| `SEARCH_DEFAULT_THRESHOLD` | no               | `0.35`                          | Cosine-similarity floor for searches that don't pass `threshold`. The right value depends on the embedding model: `text-embedding-3-small` puts most unrelated text below 0.35, while `mistral-embed` scores unrelated text around 0.7, where 0.35 filters nothing. Retune it, and `EXTRACTION_MATCH_MIN_SIMILARITY`, when you switch models. |
 
 When Postgram runs in Docker and Ollama runs directly on the Docker host, use `http://host.docker.internal:11434` for `EMBEDDING_BASE_URL`; `localhost` inside the container points at the Postgram container, not the host machine.
 
@@ -670,10 +726,11 @@ See [`specs/002-local-embeddings/quickstart.md`](specs/002-local-embeddings/quic
 | `EXTRACTION_AUTO_CREATE_MIN_CONFIDENCE`        | no                              | `0.7`                        | Minimum per-extraction confidence (0–1) required to auto-create an entity. Raise to cut noise, lower for a denser graph.                                                                                                                                                                                     |
 | `ANTHROPIC_API_KEY`                            | when provider=anthropic         |                              | Anthropic API key                                                                                                                                                                                                                                                                                            |
 | `OLLAMA_BASE_URL`                              | no                              | `http://localhost:11434`     | Ollama server URL                                                                                                                                                                                                                                                                                            |
-| `EXTRACTION_REASONING_EFFORT`                  | no                              | unset                        | `minimal` \| `low` \| `medium` \| `high`. Forwarded as `reasoning_effort` to OpenAI and Ollama for reasoning models (o-series, gpt-5, gpt-oss). When set, overrides the implicit `minimal` that `EXTRACTION_DISABLE_THINKING=true` sends to OpenAI.                                                          |
+| `EXTRACTION_REASONING_EFFORT`                  | no                              | unset                        | `minimal` \| `low` \| `medium` \| `high`. Forwarded as `reasoning_effort` to OpenAI and Ollama for reasoning models (o-series, gpt-5, gpt-oss), and to `openai-compatible` endpoints for any model when set explicitly. When set, overrides the implicit `minimal` that `EXTRACTION_DISABLE_THINKING=true` sends to OpenAI. Mistral accepts only `low` and `high` from this list. |
 | `LLM_REQUEST_TIMEOUT_MS`                       | no                              | `120000`                     | Hard cap per LLM call in milliseconds. Bump this when running slow local models (e.g. `gpt-oss:120b-cloud`).                                                                                                                                                                                                 |
 | `EXTRACTION_SEMANTIC_NEIGHBORS_ENABLED`        | no                              | `false`                      | Enable semantic neighbor linking (see below).                                                                                                                                                                                                                                                                |
 | `EXTRACTION_SEMANTIC_NEIGHBORS_MAX`            | no                              | `10`                         | Maximum number of neighbor edges to create per entity.                                                                                                                                                                                                                                                       |
+| `EXTRACTION_MATCH_MIN_SIMILARITY`              | no                              | `0.5`                        | Minimum cosine similarity (0–1) for the semantic fallback that matches an extracted target name to an existing entity. Like the other similarity floors, its useful range depends on the embedding model. |
 | `EXTRACTION_SEMANTIC_NEIGHBORS_MIN_SIMILARITY` | no                              | `0.65`                       | Minimum cosine similarity (0–1) for an entity to qualify as a neighbor. Raise to reduce noise; lower if you're finding too few neighbors. The right value depends on your embedding model's similarity distribution — use `./bin/pgm-admin link-neighbors --all --dry-run` to inspect actual scores before tuning. |
 
 **Semantic neighbor linking**: the LLM extraction pass only finds entities that
@@ -851,7 +908,8 @@ export PGM_API_KEY='<plaintext-key>'
 
 ### Search
 
-- `POST /api/search` — hybrid BM25+vector search (supports `expand_graph` and `include_content`)
+- `POST /api/search` — hybrid keyword+vector search with RRF scores (supports
+  `expand_graph` and `include_content`)
 
 REST search keeps full entity content by default for backwards compatibility.
 Pass `include_content: false` to return matched chunks without hydrating or
@@ -862,7 +920,7 @@ transport-layer conveniences for MCP and the CLI.
 ### Tasks
 
 - `POST /api/tasks` — create task
-- `GET /api/tasks` — list tasks
+- `GET /api/tasks` — list tasks (`kind=task|feature|all`, default `all`; features are tasks with `metadata.kind = 'feature'`)
 - `PATCH /api/tasks/:id` — update task
 - `POST /api/tasks/:id/complete` — complete task
 
@@ -948,14 +1006,16 @@ token-heavy outputs default to compact agent-friendly responses:
 - pass `toon: true` on list-like tools (`search`, `task_list`, `expand`) to
   receive compact TOON text from the MCP layer
 
-Search is the discovery step: inspect compact IDs, scores, and matched chunks,
-then call `recall` only for the selected entities whose complete content is
-needed. Compact `edges` summaries contain counts and relation labels only. They
-do not include neighbor content. Use `expand_graph` or `expand` when the user
-needs causes, provenance, decisions, dependencies, blockers, ownership,
-involvement, discussion participants, connected context, or graph-based
-disambiguation. Avoid expansion for direct facts already present in the matched
-chunk.
+Search is the discovery step: inspect compact IDs, relative RRF scores, and
+matched chunks, then call `recall` only for the selected entities whose
+complete content is needed. Search scores are numeric ordering values, not
+percentages; cosine `similarity` is available in the full response when a
+caller needs the vector signal. Compact `edges` summaries contain counts and
+relation labels only. They do not include neighbor content. Use
+`expand_graph` or `expand` when the user needs causes, provenance, decisions,
+dependencies, blockers, ownership, involvement, discussion participants,
+connected context, or graph-based disambiguation. Avoid expansion for direct
+facts already present in the matched chunk.
 
 The underlying API remains JSON; compacting and TOON happen only in MCP/CLI
 handlers.
@@ -1299,15 +1359,41 @@ npm run lint        # eslint
 npm run build       # typecheck
 npm run test:coverage
 npm run benchmark:search -- --assert  # 5k-entity/6k-chunk latency gate
+npm run benchmark:quality -- --assert # synthetic search relevance gate
 ```
 
-The search benchmark reports p50/p95 latency for three profiles —
+The search benchmark reports p50/p95 latency for six profiles —
 `cold_unique_queries` (every query pays a provider round trip),
-`memory_cache_hit`, and `database_cache_hit` (in-process cache empty, so only
-the persisted cache can serve it) — along with the number of embedding provider
-calls each profile made and an `EXPLAIN (ANALYZE, BUFFERS)` summary of the
-hybrid SQL. It stubs the embedding provider with a fixed delay, so it measures
-SQL time and cache hit rate; it says nothing about real provider latency.
+`memory_cache_hit`, `database_cache_hit` (in-process cache empty, so only the
+persisted cache can serve it), `long_keyword_query` (the bounded chunk GIN
+keyword branch), `pasted_query` (300 distinct input terms with 24 retained), and
+`underfilled_hnsw_fallback` (forced HNSW over a narrow tagged fixture followed
+by exact fallback) — along with the number of embedding provider calls each
+profile made and an `EXPLAIN (ANALYZE, BUFFERS)` summary of the hybrid SQL. It
+stubs the embedding provider with a fixed delay, so it measures SQL time and
+cache hit rate; it says nothing about real provider latency.
+
+Capture full plans for the actual long-keyword fixture and the HNSW strict
+iterative-scan settings with:
+
+```bash
+npm run benchmark:search -- --explain-output /tmp/search-plans.json
+```
+
+The quality benchmark reports nDCG@5, MRR, and recall@10 by category against
+the public synthetic corpus. To run private graded labels, set
+`SEARCH_QUALITY_LABELS` to a local JSONL file, pass `--private` to use the
+ignored default path `benchmarks/fixtures/private-search-quality.labels.jsonl`,
+and configure an explicit `DATABASE_URL`. This mode reads the configured
+database and label file only; it does not seed, reset, or mutate the database.
+For scoped memories, pass `--client-id <client>` or set
+`SEARCH_QUALITY_CLIENT_ID` to the actual client identity; private mode enforces
+read-only database access and verifies the configured embedding provider,
+model, and dimensions against the active identity.
+The benchmark defaults to the exact strategy for public and private labels.
+Public baseline and `--assert` gate runs therefore measure relevance
+independently of ANN approximation. Pass `--strategy auto` or `--strategy hnsw`
+to inspect approximate retrieval. Keep private labels outside version control.
 
 Targeted suites:
 

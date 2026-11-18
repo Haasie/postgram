@@ -188,7 +188,7 @@ describe('createApiClient', () => {
     await client.listTasks({ status: 'inbox', context: '@home', limit: 25, offset: 50 });
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/tasks?status=inbox&context=%40home&limit=25&offset=50',
+      '/api/tasks?kind=task&status=inbox&context=%40home&limit=25&offset=50',
       expect.objectContaining({
         headers: { Authorization: 'Bearer key' },
       })
@@ -261,5 +261,40 @@ describe('createApiClient', () => {
         body: JSON.stringify({ version: 3 }),
       })
     );
+  });
+});
+
+describe('createApiClient.getWhere', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ view: 'actions', groups: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))));
+  });
+
+  it('asks for the actions view without extra parameters when the toggle is off', async () => {
+    const client = createApiClient({ apiKey: 'test-key', onUnauthorized: vi.fn() });
+    await client.getWhere({ view: 'actions' });
+
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith('/api/where?view=actions', expect.anything());
+  });
+
+  it('asks for released and done work when the toggle is on', async () => {
+    const client = createApiClient({ apiKey: 'test-key', onUnauthorized: vi.fn() });
+    await client.getWhere({ view: 'stage', include_released: true, include_done: true });
+
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      '/api/where?view=stage&include_released=true&include_done=true',
+      expect.anything()
+    );
+  });
+
+  it('never sends include_ended and omits flags that are false', async () => {
+    const client = createApiClient({ apiKey: 'test-key', onUnauthorized: vi.fn() });
+    await client.getWhere({ view: 'actions', include_released: false, include_done: false });
+
+    const url = vi.mocked(fetch).mock.calls[0]?.[0];
+    expect(url).toBe('/api/where?view=actions');
+    expect(url).not.toContain('include_ended');
   });
 });
